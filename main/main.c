@@ -10,7 +10,9 @@
 #include "capture.h"
 #include "ethernet.h"
 #include "http_server.h"
+#include "i2s_audio.h"
 #include "jpeg_frame.h"
+#include "wifi_net.h"
 
 void app_main(void)
 {
@@ -21,6 +23,8 @@ void app_main(void)
     }
 
     ESP_ERROR_CHECK(ethernet_init());
+    ESP_ERROR_CHECK(wifi_net_init());
+    ESP_ERROR_CHECK(i2s_audio_init());
 
     g_jpeg_frame.front_idx = -1;
     g_jpeg_frame.jpeg_quality = (uint8_t)CONFIG_P4KVM_JPEG_QUALITY;
