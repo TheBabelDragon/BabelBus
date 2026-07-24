@@ -25,7 +25,6 @@ idf_component_register(
         esp_http_server
         esp_eth
         esp_netif
-        esp_wifi
         mdns
         esp_event
         nvs_flash
