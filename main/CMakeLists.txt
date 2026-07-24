@@ -5,6 +5,8 @@ set(babelbus_srcs
     "http_server.c"
     "ethernet.c"
     "jpeg_frame.c"
+    "i2s_audio.c"
+    "wifi_net.c"
     "main.c"
     "tc358743.c"
 )
@@ -19,9 +21,11 @@ idf_component_register(
         esp_driver_i2c
         esp_driver_cam
         esp_driver_isp
+        esp_driver_i2s
         esp_http_server
         esp_eth
         esp_netif
+        esp_wifi
         mdns
         esp_event
         nvs_flash
