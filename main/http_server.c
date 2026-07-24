@@ -39,22 +39,12 @@ static void stream_release_slot_ref(int slot)
 
 extern const char index_html_start[] asm("_binary_index_html_start");
 extern const char index_html_end[] asm("_binary_index_html_end");
-extern const char favicon_ico_start[] asm("_binary_favicon_ico_start");
-extern const char favicon_ico_end[] asm("_binary_favicon_ico_end");
 
 static esp_err_t root_get(httpd_req_t *req)
 {
     const size_t len = (size_t)(index_html_end - index_html_start);
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, index_html_start, len);
-}
-
-static esp_err_t favicon_get(httpd_req_t *req)
-{
-    const size_t len = (size_t)(favicon_ico_end - favicon_ico_start);
-    httpd_resp_set_type(req, "image/x-icon");
-    httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=86400");
-    return httpd_resp_send(req, favicon_ico_start, len);
 }
 
 /** GET /jpeg-quality optional query `q=1..100` sets quality; response body is current quality (text/plain). */
@@ -273,8 +263,6 @@ httpd_handle_t http_server_start(void)
 
     httpd_uri_t u_root = {.uri = "/", .method = HTTP_GET, .handler = root_get};
     httpd_register_uri_handler(h, &u_root);
-    httpd_uri_t u_favicon = {.uri = "/favicon.ico", .method = HTTP_GET, .handler = favicon_get};
-    httpd_register_uri_handler(h, &u_favicon);
     httpd_uri_t u_stream = {.uri = "/stream", .method = HTTP_GET, .handler = stream_get};
     httpd_register_uri_handler(h, &u_stream);
     httpd_uri_t u_jpeg_q = {.uri = "/jpeg-quality", .method = HTTP_GET, .handler = jpeg_quality_get};
