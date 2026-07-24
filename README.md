@@ -1,64 +1,93 @@
 # BabelBus
 
-**ESP32-P4 HDMI → CSI remote video viewer** — JPEG/MJPEG only.
+**ESP32-P4 HDMI → CSI remote A/V viewer** — JPEG/MJPEG video + optional I2S audio.
 
 No keyboard. No mouse. No USB HID gadget.
 
-Safer by design: this is a **video-only** IP display bus. You can watch a remote machine’s screen over Ethernet, but you cannot inject input.
+Safer by design: watch (and listen to) a remote machine over the network, but you **cannot inject input**.
 
-Based on Jonathan Rowny’s excellent [p4kvm](https://github.com/jrowny/p4kvm) proof-of-concept (Apache-2.0). All HID/keyboard/mouse paths have been deliberately removed.
+Based on Jonathan Rowny’s [p4kvm](https://github.com/jrowny/p4kvm) (Apache-2.0). HID paths removed; I2S audio + Wi‑Fi path added for Waveshare ESP32-P4-WIFI6 hardware.
 
 ## What it does
 
-- Captures HDMI via Toshiba TC358743 → CSI on ESP32-P4
-- Hardware JPEG encodes frames (RGB888 path)
-- Serves a simple MJPEG multipart stream over Ethernet
-- Web UI shows the live feed + JPEG quality control + optional FPS counter
+- HDMI capture via Toshiba TC358743 → CSI on ESP32-P4
+- Hardware **JPEG** encode (RGB888 path only — no H.264)
+- MJPEG multipart stream: `GET /stream`
+- Optional **I2S audio** from the adapter’s flying leads: `GET /audio` (raw s16le stereo ~48 kHz)
+- Ethernet (default) and optional **Wi‑Fi STA** via onboard ESP32-C6 (ESP-Hosted)
+- Web UI: live video + JPEG quality + FPS
 - mDNS: `http://babelbus.local/`
 
-## What it deliberately does **not** do
+## What it does **not** do
 
 - No USB HID keyboard or mouse
-- No WebSocket input channel
-- No pointer-lock / remote control
-- No H.264 (JPEG encoder only)
+- No remote control / pointer lock
+- No H.264
 
-This makes it far safer to leave on a network: compromise of the device cannot turn into keystrokes or mouse clicks on the target machine.
+## Target hardware (tested intent)
 
-## Hardware
+- **Waveshare ESP32-P4-WIFI6-Dev-Kit Rev 1.1** (Ethernet + ESP32-C6 Wi‑Fi 6)
+- **GODIYMODULES / BliKVM-style** HDMI→CSI adapter (TC358743, 1080p, I2S audio pads)
 
-Same as upstream p4kvm:
+### Video (CSI ribbon)
 
-- ESP32-P4 module with RPi-camera-compatible CSI + Ethernet (Rev < 3 recommended for this firmware)
-- Toshiba TC358743 HDMI-to-CSI adapter board
+Use the **larger** FPC into the P4 **MIPI-CSI** connector (Pi-camera compatible). I2C for the bridge is expected on that path (SDA=GPIO7, SCL=GPIO8).
+
+### Audio flying leads (your labels)
+
+| Adapter pad | Wire (yours) | Signal        | Default P4 GPIO |
+|-------------|--------------|---------------|-----------------|
+| GND         | **Black**    | Ground        | GND             |
+| OSCK        | *(empty)*    | Optional MCLK | leave open      |
+| **WFS**     | **Yellow**   | I2S WS/LRCK   | **GPIO 21**     |
+| **SD**      | **Blue**     | I2S DIN       | **GPIO 22**     |
+| **SCK**     | **White**    | I2S BCLK      | **GPIO 20**     |
+
+Change GPIOs under **menuconfig → BabelBus → I2S audio** if those pins conflict on your header.
+
+I2S is enabled by default. Stream: `http://<device>/audio`
+
+### Network
+
+- **Ethernet:** plug RJ45 — works out of the box when `P4KVM_ETH_ENABLE` is on.
+- **Wi‑Fi (C6):** P4 has no radio; Waveshare routes Wi‑Fi through **ESP32-C6 over SDIO** using ESP-Hosted.
+
+  ```bash
+  idf.py add-dependency "espressif/esp_wifi_remote"
+  idf.py add-dependency "espressif/esp_hosted"
+  ```
+
+  Then menuconfig → **BabelBus → Wi‑Fi**: enable STA, set SSID/password (2.4 GHz). Uncomment those deps in `main/idf_component.yml` if you prefer the manifest.
+
+  C6 is usually pre-flashed with ESP-Hosted slave firmware on Waveshare kits.
 
 ## Building
 
-1. ESP-IDF ≥ 5.x / 6.0.1 recommended
+1. ESP-IDF ≥ 5.x / 6.0.1
 2. `idf.py set-target esp32p4`
-3. `idf.py menuconfig` → **BabelBus** menu (chip revision, GPIO, JPEG quality, Ethernet pins)
+3. `idf.py menuconfig` → **BabelBus** (JPEG quality, Ethernet, Wi‑Fi, I2S GPIOs, TC358743 reset)
 4. `idf.py build flash monitor`
-5. Browse to `http://babelbus.local/` or the device’s IP
+5. Open `http://babelbus.local/` (or the printed IP)
 
-### Web UI source (optional)
+## Endpoints
 
-```bash
-cd web
-npm install
-npm run build
-# then rebuild/flash firmware so the embedded index.html is updated
-```
+| Path            | Description                                      |
+|-----------------|--------------------------------------------------|
+| `/`             | Web UI (video)                                   |
+| `/stream`       | MJPEG multipart                                  |
+| `/jpeg-quality` | GET; `?q=1..100` sets quality                    |
+| `/audio`        | Raw PCM s16le stereo (when I2S enabled)          |
 
-## Security note
+## Security
 
-Still a proof-of-concept. Do **not** expose it to the public internet. Use a VPN (Tailscale, WireGuard, etc.) if you need remote access.
+Still a POC. Do **not** expose to the public internet. Prefer VPN (Tailscale, WireGuard) for remote viewing over Wi‑Fi or WAN.
 
 ## License
 
-Apache-2.0 (same as original p4kvm). Original work © Jonathan Rowny. Modifications for BabelBus (HID removal, rename, video-only) © 2026.
+Apache-2.0. Original © Jonathan Rowny. BabelBus modifications (HID removal, I2S audio, Wi‑Fi path, rename) © 2026.
 
 ## Credits
 
-- [jrowny/p4kvm](https://github.com/jrowny/p4kvm) — the foundation
-- Espressif ESP32-P4 + JPEG encoder
+- [jrowny/p4kvm](https://github.com/jrowny/p4kvm)
+- Espressif ESP32-P4 / JPEG / ESP-Hosted
 - Toshiba TC358743
