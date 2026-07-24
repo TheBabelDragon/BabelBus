@@ -6,6 +6,8 @@
 
 #include "sdkconfig.h"
 
+#include <string.h>
+
 #include "esp_check.h"
 #include "esp_event.h"
 #include "esp_log.h"
