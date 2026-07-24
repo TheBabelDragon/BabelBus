@@ -109,4 +109,55 @@ menu "BabelBus HDMI → CSI"
         default 5
         depends on P4KVM_ETH_ENABLE
 
+    menu "Wi-Fi (ESP32-C6 co-processor)"
+        config BABELBUS_WIFI_ENABLE
+            bool "Enable Wi-Fi STA via ESP-Hosted / esp_wifi_remote"
+            default n
+            help
+                Waveshare ESP32-P4-WIFI6 boards talk to an onboard ESP32-C6 over SDIO.
+                Add components: espressif/esp_hosted and espressif/esp_wifi_remote.
+                C6 must run ESP-Hosted slave firmware (factory default on Waveshare).
+                2.4 GHz only. Ethernet can stay enabled in parallel.
+
+        config BABELBUS_WIFI_SSID
+            string "Wi-Fi SSID"
+            default "babelbus"
+            depends on BABELBUS_WIFI_ENABLE
+
+        config BABELBUS_WIFI_PASSWORD
+            string "Wi-Fi password"
+            default "babelbus"
+            depends on BABELBUS_WIFI_ENABLE
+    endmenu
+
+    menu "I2S audio (HDMI adapter flying leads)"
+        config BABELBUS_I2S_AUDIO_ENABLE
+            bool "Enable I2S RX from HDMI→CSI adapter"
+            default y
+            help
+                Capture PCM from the adapter's I2S pads (WFS/SD/SCK). Bridge is I2S master;
+                P4 runs as I2S slave. Streamed at GET /audio (raw s16le stereo).
+
+        config BABELBUS_I2S_BCLK_GPIO
+            int "I2S BCLK GPIO (adapter SCK, often white)"
+            range ENV_GPIO_RANGE_MIN ENV_GPIO_IN_RANGE_MAX
+            default 20 if IDF_TARGET_ESP32P4
+            default 0
+            depends on BABELBUS_I2S_AUDIO_ENABLE
+
+        config BABELBUS_I2S_WS_GPIO
+            int "I2S WS/LRCK GPIO (adapter WFS, often yellow)"
+            range ENV_GPIO_RANGE_MIN ENV_GPIO_IN_RANGE_MAX
+            default 21 if IDF_TARGET_ESP32P4
+            default 0
+            depends on BABELBUS_I2S_AUDIO_ENABLE
+
+        config BABELBUS_I2S_DIN_GPIO
+            int "I2S DIN GPIO (adapter SD, often blue)"
+            range ENV_GPIO_RANGE_MIN ENV_GPIO_IN_RANGE_MAX
+            default 22 if IDF_TARGET_ESP32P4
+            default 0
+            depends on BABELBUS_I2S_AUDIO_ENABLE
+    endmenu
+
 endmenu
