@@ -2,7 +2,7 @@
 # esp_http_server: max_open_sockets + 3 internal fds must be <= CONFIG_LWIP_MAX_SOCKETS.
 CONFIG_LWIP_MAX_SOCKETS=24
 
-CONFIG_BABELBUS_JPEG_QUALITY=70
+CONFIG_P4KVM_JPEG_QUALITY=70
 
 # Default 1024 is too small for Chromium headers → 431 on device.
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=8192
