@@ -11,8 +11,10 @@
 
 #if CONFIG_BABELBUS_I2S_AUDIO_ENABLE
 
-#include "driver/i2s_std.h"
 #include "driver/gpio.h"
+#include "driver/i2s_std.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "i2s_audio";
 static i2s_chan_handle_t s_rx;
