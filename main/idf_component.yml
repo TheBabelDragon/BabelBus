@@ -1,0 +1,4 @@
+## IDF Component Manager manifest
+dependencies:
+  espressif/mdns:
+    version: "^1.8.0"
