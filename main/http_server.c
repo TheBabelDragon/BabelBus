@@ -17,6 +17,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "i2s_audio.h"
 #include "jpeg_frame.h"
 
 static const char *TAG = "babelbus";
@@ -36,6 +37,8 @@ static void stream_release_slot_ref(int slot)
 
 #define STREAM_WORKER_STACK (12 * 1024)
 #define STREAM_WORKER_PRIO (tskIDLE_PRIORITY + 5)
+#define AUDIO_WORKER_STACK (8 * 1024)
+#define AUDIO_CHUNK 2048
 
 extern const char index_html_start[] asm("_binary_index_html_start");
 extern const char index_html_end[] asm("_binary_index_html_end");
@@ -241,6 +244,51 @@ static esp_err_t stream_get(httpd_req_t *req)
     return ESP_OK;
 }
 
+/** GET /audio — endless chunked body of raw s16le stereo PCM (~48 kHz). */
+static void audio_worker_task(void *arg)
+{
+    httpd_req_t *req = (httpd_req_t *)arg;
+    uint8_t buf[AUDIO_CHUNK];
+
+    while (1) {
+        if (stream_peer_disconnected(req)) {
+            break;
+        }
+        size_t n = i2s_audio_read(buf, sizeof(buf), 200);
+        if (n == 0) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        if (httpd_resp_send_chunk(req, (const char *)buf, n) != ESP_OK) {
+            break;
+        }
+    }
+    httpd_resp_sendstr_chunk(req, NULL);
+    (void)httpd_req_async_handler_complete(req);
+    vTaskDelete(NULL);
+}
+
+static esp_err_t audio_get(httpd_req_t *req)
+{
+    if (!i2s_audio_ready()) {
+        return httpd_resp_send_err(req, HTTPD_503_SERVICE_UNAVAILABLE, "audio disabled or not ready");
+    }
+    httpd_resp_set_type(req, "application/octet-stream");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "X-BabelBus-Audio", "s16le,2ch,48000");
+
+    httpd_req_t *async_req = NULL;
+    if (httpd_req_async_handler_begin(req, &async_req) != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "audio busy");
+    }
+    if (xTaskCreate(audio_worker_task, "bb_audio", AUDIO_WORKER_STACK, async_req, tskIDLE_PRIORITY + 4, NULL) !=
+        pdPASS) {
+        httpd_req_async_handler_complete(async_req);
+        return httpd_resp_send_custom_err(req, "503 Service Unavailable", "audio task");
+    }
+    return ESP_OK;
+}
+
 httpd_handle_t http_server_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
@@ -267,5 +315,7 @@ httpd_handle_t http_server_start(void)
     httpd_register_uri_handler(h, &u_stream);
     httpd_uri_t u_jpeg_q = {.uri = "/jpeg-quality", .method = HTTP_GET, .handler = jpeg_quality_get};
     httpd_register_uri_handler(h, &u_jpeg_q);
+    httpd_uri_t u_audio = {.uri = "/audio", .method = HTTP_GET, .handler = audio_get};
+    httpd_register_uri_handler(h, &u_audio);
     return h;
 }
