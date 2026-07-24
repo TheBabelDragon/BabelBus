@@ -1,0 +1,18 @@
+# Full-frame capture @ 1080p needs PSRAM (ping-pong buffers + JPEG + HTTP copy).
+# esp_http_server: max_open_sockets + 3 internal fds must be <= CONFIG_LWIP_MAX_SOCKETS.
+CONFIG_LWIP_MAX_SOCKETS=24
+
+CONFIG_BABELBUS_JPEG_QUALITY=70
+
+# Default 1024 is too small for Chromium headers → 431 on device.
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=8192
+
+# ESP32-P4 AP-HEX PSRAM
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_HEX=y
+CONFIG_SPIRAM_SPEED_200M=y
+
+# MJPEG pushes large JPEG segments; lwIP defaults cause backpressure on Ethernet.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65535
+CONFIG_LWIP_TCP_WND_DEFAULT=65535
+CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=6144
