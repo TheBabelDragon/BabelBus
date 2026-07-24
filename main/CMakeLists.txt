@@ -14,7 +14,6 @@ idf_component_register(
     INCLUDE_DIRS "."
     EMBED_FILES
         "index.html"
-        "favicon.ico"
     REQUIRES
         esp_driver_gpio
         esp_driver_i2c
