@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="Cache-Control" content="no-cache" />
+    <title>BabelBus</title>
+    <style>
+      :root { color-scheme: dark; }
+      body {
+        margin: 0;
+        font-family: system-ui, sans-serif;
+        background: #1a1a1f;
+        color: #e8f0ff;
+      }
+      header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 1rem;
+        padding: 0.65rem 1rem;
+        border-bottom: 1px solid #ffffff1f;
+      }
+      h1 { margin: 0; font-size: 1.25rem; font-weight: 600; color: #c8d4ee; }
+      .right { display: flex; align-items: center; gap: 0.75rem; }
+      #st { margin: 0; font-size: 0.9rem; color: #c8d4ee; }
+      #fps { font-variant-numeric: tabular-nums; color: #8bd88b; font-size: 0.9rem; }
+      #fps.hidden { display: none; }
+      details { position: relative; }
+      summary {
+        list-style: none;
+        cursor: pointer;
+        padding: 0.35rem 0.5rem;
+        border-radius: 6px;
+        color: #c8d4ee;
+      }
+      summary::-webkit-details-marker { display: none; }
+      summary:hover { background: #ffffff14; }
+      .panel {
+        position: absolute;
+        right: 0;
+        top: calc(100% + 0.35rem);
+        z-index: 20;
+        min-width: 16rem;
+        background: #252530;
+        border: 1px solid #ffffff26;
+        border-radius: 8px;
+        padding: 1rem 0.85rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+        box-shadow: 0 6px 20px #00000073;
+      }
+      .panel label { display: flex; flex-direction: column; gap: 0.35rem; font-size: 0.85rem; color: #b8c4dc; }
+      .panel .row { display: flex; gap: 0.5rem; align-items: center; }
+      input[type="number"] { width: 3.5rem; font: inherit; padding: 0.25rem 0.35rem; }
+      button {
+        font: inherit;
+        cursor: pointer;
+        color: #e8edf8;
+        background: #353542;
+        border: 1px solid #ffffff24;
+        border-radius: 6px;
+        padding: 0.4rem 0.75rem;
+      }
+      button:hover { background: #3f3f4e; }
+      .wrap { width: 100%; position: relative; }
+      #view {
+        width: 100%;
+        max-width: 100%;
+        height: auto;
+        aspect-ratio: 16/9;
+        background: #111;
+        display: block;
+      }
+      .note { color: #888; font-size: 0.85rem; padding: 0.75rem 1rem; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>BabelBus</h1>
+      <div class="right">
+        <p id="st">Connecting…</p>
+        <span id="fps" class="hidden">FPS: --</span>
+        <details>
+          <summary title="Settings">⚙</summary>
+          <div class="panel">
+            <label>
+              Encoding quality (1–100)
+              <span class="row">
+                <input type="number" id="jpeg-q" min="1" max="100" step="1" value="70" />
+                <button type="button" id="btn-jpeg-q">Apply</button>
+              </span>
+            </label>
+            <label class="row">
+              <input type="checkbox" id="show-fps" />
+              Show FPS
+            </label>
+          </div>
+        </details>
+      </div>
+    </header>
+    <div class="wrap">
+      <canvas id="view" width="1920" height="1080"></canvas>
+    </div>
+    <p class="note">Video-only stream. No keyboard or mouse control (by design).</p>
+    <script>
+      (function () {
+        const W = 1920, H = 1080;
+        const canvas = document.getElementById("view");
+        const ctx = canvas.getContext("2d");
+        const st = document.getElementById("st");
+        const fpsEl = document.getElementById("fps");
+        const jpegQ = document.getElementById("jpeg-q");
+        const btnQ = document.getElementById("btn-jpeg-q");
+        const showFps = document.getElementById("show-fps");
+
+        let frameCount = 0, lastT = performance.now();
+        let abortCtrl = null;
+
+        function findBytes(hay, needle) {
+          for (let i = 0; i <= hay.length - needle.length; i++) {
+            let j = 0;
+            while (j < needle.length && hay[i + j] === needle[j]) j++;
+            if (j === needle.length) return i;
+          }
+          return -1;
+        }
+
+        const BOUNDARY = new TextEncoder().encode("--frame\r\n");
+        const HEADER_END = new TextEncoder().encode("\r\n\r\n");
+
+        async function stream() {
+          if (abortCtrl) abortCtrl.abort();
+          abortCtrl = new AbortController();
+          for (;;) {
+            try {
+              st.textContent = "Streaming";
+              const res = await fetch("/stream", { signal: abortCtrl.signal });
+              const reader = res.body.getReader();
+              let buf = new Uint8Array(0);
+              for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                if (value && value.length) {
+                  const t = new Uint8Array(buf.length + value.length);
+                  t.set(buf); t.set(value, buf.length); buf = t;
+                }
+                while (buf.length > 0) {
+                  const bIdx = findBytes(buf, BOUNDARY);
+                  if (bIdx < 0) break;
+                  const after = buf.slice(bIdx + BOUNDARY.length);
+                  const hEnd = findBytes(after, HEADER_END);
+                  if (hEnd < 0) break;
+                  const hText = new TextDecoder().decode(after.slice(0, hEnd));
+                  const m = hText.match(/Content-Length:\s*(\d+)/i);
+                  if (!m) { buf = buf.slice(bIdx + BOUNDARY.length); break; }
+                  const jpegLen = parseInt(m[1], 10);
+                  const start = bIdx + BOUNDARY.length + hEnd + HEADER_END.length;
+                  const end = start + jpegLen + 2;
+                  if (buf.length < end) break;
+                  const jpeg = buf.slice(start, start + jpegLen);
+                  try {
+                    const bmp = await createImageBitmap(new Blob([jpeg], { type: "image/jpeg" }));
+                    ctx.drawImage(bmp, 0, 0, W, H);
+                    bmp.close();
+                    frameCount++;
+                    if (performance.now() - lastT >= 1000) {
+                      if (showFps.checked) {
+                        fpsEl.textContent = "FPS: " + frameCount;
+                        fpsEl.classList.remove("hidden");
+                      }
+                      frameCount = 0;
+                      lastT = performance.now();
+                    }
+                  } catch (_) {}
+                  buf = buf.slice(end);
+                }
+              }
+            } catch (e) {
+              if (abortCtrl.signal.aborted) return;
+              st.textContent = "Reconnecting…";
+            }
+            await new Promise((r) => setTimeout(r, 1000));
+          }
+        }
+
+        async function syncQ() {
+          try {
+            const r = await fetch("/jpeg-quality", { cache: "no-store" });
+            if (!r.ok) return;
+            const n = parseInt((await r.text()).trim(), 10);
+            if (n >= 1 && n <= 100) jpegQ.value = String(n);
+          } catch (_) {}
+        }
+
+        async function applyQ() {
+          let q = parseInt(jpegQ.value, 10);
+          if (isNaN(q)) return;
+          q = Math.max(1, Math.min(100, q));
+          jpegQ.value = String(q);
+          try {
+            const r = await fetch("/jpeg-quality?q=" + q, { cache: "no-store" });
+            if (r.ok) {
+              const n = parseInt((await r.text()).trim(), 10);
+              if (n >= 1 && n <= 100) jpegQ.value = String(n);
+            }
+          } catch (_) {}
+        }
+
+        btnQ.addEventListener("click", applyQ);
+        jpegQ.addEventListener("keydown", (e) => { if (e.key === "Enter") applyQ(); });
+        showFps.addEventListener("change", () => {
+          fpsEl.classList.toggle("hidden", !showFps.checked);
+        });
+
+        syncQ();
+        stream();
+      })();
+    </script>
+  </body>
+</html>
