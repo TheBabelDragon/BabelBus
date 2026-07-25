@@ -39,6 +39,7 @@
 
 static esp_cam_ctlr_handle_t s_cam;
 static isp_proc_handle_t s_isp_bypass;
+static bool s_cam_started;
 
 /* CSI-2 RGB888 user data type */
 static const uint32_t s_csi_expected_dt = 0x24u;
@@ -289,6 +290,7 @@ capture_ctx_t *capture_hw_init_start(void)
 
     capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
     ESP_ERROR_CHECK(esp_cam_ctlr_start(s_cam));
+    s_cam_started = true;
     ESP_LOGI(CAPTURE_LOG_TAG, "esp_cam_ctlr_start (RGB888 / DT 0x24)");
 
     return &s_cap;
@@ -311,20 +313,25 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     bool locked = tc_has_pixel_stream(c->tc);
     ESP_LOGW(CAPTURE_LOG_TAG, "HDMI recover (locked=%d)", (int)locked);
 
-    esp_err_t er = esp_cam_ctlr_stop(s_cam);
-    if (er != ESP_OK && er != ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(CAPTURE_LOG_TAG, "esp_cam_ctlr_stop: %s", esp_err_to_name(er));
+    /* Only stop if we previously started — otherwise the IDF driver logs
+     * "driver isn't started" at ERROR level before returning INVALID_STATE. */
+    if (s_cam_started) {
+        esp_err_t er = esp_cam_ctlr_stop(s_cam);
+        if (er != ESP_OK && er != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(CAPTURE_LOG_TAG, "esp_cam_ctlr_stop: %s", esp_err_to_name(er));
+        }
+        s_cam_started = false;
     }
     capture_drain_csi_done_sem(c->csi_done_sem);
 
     if (!locked) {
-        er = tc358743_hdmi_hotplug_reset(c->tc);
+        esp_err_t er = tc358743_hdmi_hotplug_reset(c->tc);
         if (er != ESP_OK) {
             ESP_LOGW(CAPTURE_LOG_TAG, "hotplug_reset: %s", esp_err_to_name(er));
         }
         wait_tc358743_pixel_stream(c->tc, 10000);
     } else {
-        er = tc358743_reapply_csi_path_after_hdmi(c->tc);
+        esp_err_t er = tc358743_reapply_csi_path_after_hdmi(c->tc);
         if (er != ESP_OK) {
             ESP_LOGW(CAPTURE_LOG_TAG, "reapply_csi: %s", esp_err_to_name(er));
         }
@@ -344,11 +351,12 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     c->csi_dma_done_irqs = 0;
     c->csi_get_new_irqs = 0;
 
-    er = esp_cam_ctlr_start(s_cam);
+    esp_err_t er = esp_cam_ctlr_start(s_cam);
     if (er != ESP_OK) {
         ESP_LOGE(CAPTURE_LOG_TAG, "esp_cam_ctlr_start after recover: %s", esp_err_to_name(er));
         return er;
     }
+    s_cam_started = true;
     ESP_LOGI(CAPTURE_LOG_TAG, "esp_cam_ctlr_start after recover (RGB888)");
     return ESP_OK;
 }
