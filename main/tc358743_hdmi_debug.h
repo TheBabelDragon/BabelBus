@@ -22,4 +22,12 @@ static inline void tc358743_debug_status(tc358743_t *dev)
              "SYS_STATUS=0x%02x DDC5V=%d TMDS=%d PLL=%d SCDT=%d HDMI=%d HDCP=%d AVMUTE=%d SYNC=%d",
              st, (int)(st & 1), (int)((st >> 1) & 1), (int)((st >> 2) & 1), (int)((st >> 3) & 1),
              (int)((st >> 4) & 1), (int)((st >> 5) & 1), (int)((st >> 6) & 1), (int)((st >> 7) & 1));
+    /*
+     * DDC5V must follow the HDMI cable. If it stays 1 with the cable unplugged,
+     * the adapter's +5V sense is backfed or stuck — software cannot clear that.
+     */
+    if ((st & 1) != 0 && ((st >> 1) & 1) == 0) {
+        ESP_LOGW("tc358743",
+                 "DDC5V=1 but TMDS=0: cable-sense may be stuck/backfed (confirm DDC5V=0 with HDMI unplugged)");
+    }
 }
