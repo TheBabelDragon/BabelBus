@@ -11,7 +11,7 @@
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "esp_private/esp__cache_private.h"
+#include "esp_private/esp_cache_private.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -282,7 +282,7 @@ capture_ctx_t *capture_hw_init_start(void)
     ESP_ERROR_CHECK(esp_isp_new_processor(&isp_cfg, &s_isp_bypass));
     ISP.cntl.isp_en = 0;
     capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
-   
+
     ESP_ERROR_CHECK(tc358743_enable_hdmi_output(s_cap.tc));
     wait_tc358743_pixel_stream(s_cap.tc, 5000);
 
