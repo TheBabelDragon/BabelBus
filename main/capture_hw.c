@@ -42,6 +42,16 @@ static const uint32_t s_csi_expected_dt = 0x24u;
 
 static capture_ctx_t s_cap;
 
+/** IDF 5.4 has no flags.bypass_isp; keep hardware ISP pipeline off for RGB888 CSI passthrough. */
+static void capture_force_isp_bypass(void)
+{
+    ISP.cntl.isp_en = 0;
+    /* Driver/cam start can reassert; clear again after a short settle. */
+    vTaskDelay(pdMS_TO_TICKS(1));
+    ISP.cntl.isp_en = 0;
+    ESP_LOGI(CAPTURE_LOG_TAG, "ISP.cntl=0x%08" PRIx32 " (isp_en should be 0)", (uint32_t)ISP.cntl.val);
+}
+
 static void tc358743_resetn_pulse(void)
 {
 #if CONFIG_P4KVM_TC358743_RST_GPIO >= 0
@@ -71,6 +81,7 @@ static void wait_tc358743_pixel_stream(tc358743_t *tc, uint32_t timeout_ms)
     uint32_t waited = 0;
     while (waited < timeout_ms) {
         uint8_t st = 0;
+        /* TMDS (bit1) + SYNC (bit7) — enough for pixel stream (HDMI bit optional / DVI). */
         if (tc358743_sys_status(tc, &st) == ESP_OK && (st & 0x02) != 0 && (st & 0x80) != 0) {
             ESP_LOGI(CAPTURE_LOG_TAG, "HDMI ready SYS_STATUS=0x%02x after %" PRIu32 " ms", st, waited);
             return;
@@ -141,14 +152,12 @@ unsigned capture_csi_bpp(void)
 
 void capture_fill_esp_cam_color_types(esp_cam_ctlr_csi_config_t *csi, esp_isp_processor_cfg_t *isp)
 {
-    /* Real wire format from TC358743 is RGB888 into the CSI controller. */
     csi->input_data_color_type = CAM_CTLR_COLOR_RGB888;
     csi->output_data_color_type = CAM_CTLR_COLOR_RGB888;
     /*
-     * IDF 5.4: ISP_COLOR_RGB888 is rejected ("invalid input color space") because
-     * .flags.bypass_isp does not exist yet. Use RAW8 only to satisfy esp_isp_new_processor;
-     * we force hardware bypass with ISP.cntl.isp_en = 0 so ISP does not process pixels.
-     * On IDF 5.5+/6.x prefer ISP_COLOR_RGB888 + .flags.bypass_isp = true.
+     * IDF 5.4: no .flags.bypass_isp — RAW8 only to pass esp_isp_new_processor validation.
+     * Real pixels are RGB888 CSI; ISP must stay disabled (capture_force_isp_bypass).
+     * IDF 5.5+/6.x: ISP_COLOR_RGB888 + .flags.bypass_isp = true is the correct path.
      */
     isp->input_data_color_type = ISP_COLOR_RAW8;
     isp->output_data_color_type = ISP_COLOR_RAW8;
@@ -261,7 +270,6 @@ capture_ctx_t *capture_hw_init_start(void)
         .byte_swap_en = false,
         .bk_buffer_dis = true,
     };
-    /* IDF 5.4: no .flags.bypass_isp; hardware bypass via ISP.cntl.isp_en = 0 below. */
     esp_isp_processor_cfg_t isp_cfg = {
         .clk_src = ISP_CLK_SRC_DEFAULT,
         .clk_hz = 80 * 1000000,
@@ -287,14 +295,16 @@ capture_ctx_t *capture_hw_init_start(void)
 
     ESP_ERROR_CHECK(esp_cam_ctlr_enable(s_cam));
     ESP_ERROR_CHECK(esp_isp_new_processor(&isp_cfg, &s_isp_bypass));
-    ISP.cntl.isp_en = 0;
+    capture_force_isp_bypass();
     capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
 
     ESP_ERROR_CHECK(tc358743_enable_hdmi_output(s_cap.tc));
     wait_tc358743_pixel_stream(s_cap.tc, 5000);
 
     capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
+    capture_force_isp_bypass();
     ESP_ERROR_CHECK(esp_cam_ctlr_start(s_cam));
+    capture_force_isp_bypass();
     ESP_LOGI(CAPTURE_LOG_TAG, "esp_cam_ctlr_start after HDMI lock");
 
     return &s_cap;
@@ -339,6 +349,7 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     }
 
     capture_configure_p4_csi_bridge(c->hres, c->vres);
+    capture_force_isp_bypass();
 
     c->ping_fb_idx = 0;
     c->done_fb = NULL;
@@ -346,6 +357,7 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     c->csi_get_new_irqs = 0;
 
     er = esp_cam_ctlr_start(s_cam);
+    capture_force_isp_bypass();
     if (er != ESP_OK) {
         ESP_LOGE(CAPTURE_LOG_TAG, "esp_cam_ctlr_start after recover: %s", esp_err_to_name(er));
         return er;
