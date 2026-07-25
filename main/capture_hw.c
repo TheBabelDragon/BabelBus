@@ -92,7 +92,6 @@ static void wait_tc358743_pixel_stream(tc358743_t *tc, uint32_t timeout_ms)
             tc358743_debug_bridge(tc);
             return;
         }
-        /* Progress every 2 s so UART shows lock state without flooding */
         if (waited > 0 && (waited % 2000u) == 0u) {
             ESP_LOGW(CAPTURE_LOG_TAG, "HDMI still unlocked after %" PRIu32 " ms", waited);
             tc358743_debug_status(tc);
@@ -105,6 +104,44 @@ static void wait_tc358743_pixel_stream(tc358743_t *tc, uint32_t timeout_ms)
     tc358743_debug_status(tc);
     tc358743_debug_bridge(tc);
     tc358743_debug_stall_extras(tc);
+}
+
+/**
+ * Harden against single-shot HPD/EDID failures (common when RESETN is not
+ * wired and some sources need several hotplug edges before enabling TMDS).
+ */
+static void hardened_hdmi_bringup(tc358743_t *tc)
+{
+    const int attempts = 4;
+    ESP_LOGI(CAPTURE_LOG_TAG, "Hardened HDMI bring-up: %d HPD/EDID cycles", attempts);
+
+    ESP_ERROR_CHECK(tc358743_enable_hdmi_output(tc));
+
+    for (int i = 1; i <= attempts; i++) {
+        ESP_LOGI(CAPTURE_LOG_TAG, "HPD/EDID attempt %d/%d", i, attempts);
+        tc358743_debug_status(tc);
+
+        if (i > 1) {
+            esp_err_t er = tc358743_hdmi_hotplug_reset(tc);
+            if (er != ESP_OK) {
+                ESP_LOGW(CAPTURE_LOG_TAG, "hotplug_reset: %s", esp_err_to_name(er));
+            }
+            /* Extra settle for stubborn sources after HPD edge */
+            vTaskDelay(pdMS_TO_TICKS(300));
+        }
+
+        wait_tc358743_pixel_stream(tc, 5000);
+        if (tc_has_pixel_stream(tc)) {
+            ESP_LOGI(CAPTURE_LOG_TAG, "HDMI locked on attempt %d/%d", i, attempts);
+            return;
+        }
+        ESP_LOGW(CAPTURE_LOG_TAG, "Attempt %d/%d: still no TMDS (ruling out flaky single HPD)", i, attempts);
+        tc358743_debug_bridge(tc);
+        tc358743_debug_stall_extras(tc);
+    }
+
+    ESP_LOGW(CAPTURE_LOG_TAG,
+             "All %d HPD/EDID attempts failed — not a one-shot handshake glitch", attempts);
 }
 
 void capture_debug_csi_timeout(capture_ctx_t *c, unsigned bpp, size_t fb_bytes)
@@ -225,12 +262,11 @@ capture_ctx_t *capture_hw_init_start(void)
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus));
     ESP_ERROR_CHECK(tc358743_probe(i2c_bus, NULL, &s_cap.tc));
     ESP_ERROR_CHECK(tc358743_init_streaming(s_cap.tc));
-    /* RGB888 path — do not force UYVY */
     tc358743_set_csi_uyvy422(s_cap.tc, false);
 
     s_cap.hres = P4KVM_CSI_H_RES;
     s_cap.vres = P4KVM_CSI_V_RES;
-    s_cap.frame_bytes = (size_t)s_cap.hres * (size_t)s_cap.vres * 3u; /* RGB888 */
+    s_cap.frame_bytes = (size_t)s_cap.hres * (size_t)s_cap.vres * 3u;
 
     size_t align = 0;
     ESP_ERROR_CHECK(esp_cache_get_alignment(MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA, &align));
@@ -298,18 +334,11 @@ capture_ctx_t *capture_hw_init_start(void)
     ISP.cntl.isp_en = 0;
     capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
 
-    ESP_ERROR_CHECK(tc358743_enable_hdmi_output(s_cap.tc));
-#if CONFIG_P4KVM_TC358743_RST_GPIO < 0
-    /* No hard RESETN: second HPD edge so source re-reads EDID (matches his pulsed-RST boards better). */
-    ESP_LOGI(CAPTURE_LOG_TAG, "No RESETN wired — extra HPD hotplug cycle");
-    (void)tc358743_hdmi_hotplug_reset(s_cap.tc);
-#endif
-    wait_tc358743_pixel_stream(s_cap.tc, 10000);
+    /* Multi-cycle HPD/EDID — rules out one-shot handshake issues */
+    hardened_hdmi_bringup(s_cap.tc);
 
     if (!tc_has_pixel_stream(s_cap.tc)) {
-        ESP_LOGW(CAPTURE_LOG_TAG, "No TMDS yet — starting CSI anyway (plug HDMI / set 1080p)");
-        tc358743_debug_bridge(s_cap.tc);
-        tc358743_debug_stall_extras(s_cap.tc);
+        ESP_LOGW(CAPTURE_LOG_TAG, "No TMDS after hardened bring-up — starting CSI anyway");
     }
 
     capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
@@ -339,8 +368,6 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     tc358743_debug_status(c->tc);
     tc358743_debug_bridge(c->tc);
 
-    /* Only stop if we previously started — otherwise the IDF driver logs
-     * "driver isn't started" at ERROR level before returning INVALID_STATE. */
     if (s_cam_started) {
         esp_err_t er = esp_cam_ctlr_stop(s_cam);
         if (er != ESP_OK && er != ESP_ERR_INVALID_STATE) {
@@ -351,11 +378,19 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     capture_drain_csi_done_sem(c->csi_done_sem);
 
     if (!locked) {
-        esp_err_t er = tc358743_hdmi_hotplug_reset(c->tc);
-        if (er != ESP_OK) {
-            ESP_LOGW(CAPTURE_LOG_TAG, "hotplug_reset: %s", esp_err_to_name(er));
+        /* Same hardened multi-cycle path as boot */
+        for (int i = 1; i <= 3; i++) {
+            ESP_LOGI(CAPTURE_LOG_TAG, "Recover HPD attempt %d/3", i);
+            esp_err_t er = tc358743_hdmi_hotplug_reset(c->tc);
+            if (er != ESP_OK) {
+                ESP_LOGW(CAPTURE_LOG_TAG, "hotplug_reset: %s", esp_err_to_name(er));
+            }
+            vTaskDelay(pdMS_TO_TICKS(300));
+            wait_tc358743_pixel_stream(c->tc, 5000);
+            if (tc_has_pixel_stream(c->tc)) {
+                break;
+            }
         }
-        wait_tc358743_pixel_stream(c->tc, 10000);
     } else {
         esp_err_t er = tc358743_reapply_csi_path_after_hdmi(c->tc);
         if (er != ESP_OK) {
@@ -364,7 +399,7 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     }
 
     if (!tc_has_pixel_stream(c->tc)) {
-        ESP_LOGW(CAPTURE_LOG_TAG, "Still no TMDS — not starting CSI (fix HDMI source)");
+        ESP_LOGW(CAPTURE_LOG_TAG, "Still no TMDS after hardened recover");
         tc358743_debug_status(c->tc);
         tc358743_debug_bridge(c->tc);
         tc358743_debug_stall_extras(c->tc);
