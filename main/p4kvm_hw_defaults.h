@@ -14,5 +14,5 @@
 #define P4KVM_CSI_H_RES 1920u
 #define P4KVM_CSI_V_RES 1080u
 
-/* Same as jrowny/p4kvm — 1080p30 RGB888 fits 2×972 Mbps. */
-#define P4KVM_MIPI_LANE_MBPS 972
+/* 1080p60 UYVY on 2 lanes needs ~1.2 Gbps/lane headroom (was 972 for 1080p30). */
+#define P4KVM_MIPI_LANE_MBPS 1200
