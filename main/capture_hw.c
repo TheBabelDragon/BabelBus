@@ -2,8 +2,7 @@
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * Requires ESP-IDF 5.5+ / 6.0.1 for esp_isp_processor_cfg_t.flags.bypass_isp
- * and ISP_COLOR_RGB888 on the CSI path.
+ * Requires ESP-IDF 5.5+ / 6.0.1 for .flags.bypass_isp + ISP_COLOR_RGB888.
  */
 #include "capture_priv.h"
 
@@ -237,7 +236,7 @@ capture_ctx_t *capture_hw_init_start(void)
     s_cap.csi_dma_done_irqs = 0;
     s_cap.csi_get_new_irqs = 0;
 
-    ESP_LOGI(CAPTURE_LOG_TAG, "CSI 24bpp BGR ring %u x %zu bytes (align %zu)", CAPTURE_FB_COUNT, s_cap.frame_bytes, align);
+    ESP_LOGI(CAPTURE_LOG_TAG, "CSI 24bpp RGB ring %u x %zu bytes (align %zu)", CAPTURE_FB_COUNT, s_cap.frame_bytes, align);
 
     s_cap.csi_done_sem = xSemaphoreCreateCounting(32, 0);
     if (!s_cap.csi_done_sem) {
@@ -269,6 +268,7 @@ capture_ctx_t *capture_hw_init_start(void)
         .v_res = s_cap.vres,
         .bayer_order = COLOR_RAW_ELEMENT_ORDER_BGGR,
         .intr_priority = 0,
+        /* Let the driver own ISP enable; do NOT poke ISP.cntl.isp_en=0 after this. */
         .flags = {.bypass_isp = true, .byte_swap_en = false},
     };
     capture_fill_esp_cam_color_types(&csi_cfg, &isp_cfg);
@@ -283,7 +283,8 @@ capture_ctx_t *capture_hw_init_start(void)
 
     ESP_ERROR_CHECK(esp_cam_ctlr_enable(s_cam));
     ESP_ERROR_CHECK(esp_isp_new_processor(&isp_cfg, &s_isp_bypass));
-    ISP.cntl.isp_en = 0;
+    /* Optional: enable processor clocks; bypass still skips pixel ops. */
+    (void)esp_isp_enable(s_isp_bypass);
     capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
 
     ESP_ERROR_CHECK(tc358743_enable_hdmi_output(s_cap.tc));
@@ -291,7 +292,7 @@ capture_ctx_t *capture_hw_init_start(void)
 
     capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
     ESP_ERROR_CHECK(esp_cam_ctlr_start(s_cam));
-    ESP_LOGI(CAPTURE_LOG_TAG, "esp_cam_ctlr_start after HDMI lock");
+    ESP_LOGI(CAPTURE_LOG_TAG, "esp_cam_ctlr_start after HDMI lock (bypass_isp=1, expect dma_done)");
 
     return &s_cap;
 }
