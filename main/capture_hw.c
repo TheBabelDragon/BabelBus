@@ -141,10 +141,17 @@ unsigned capture_csi_bpp(void)
 
 void capture_fill_esp_cam_color_types(esp_cam_ctlr_csi_config_t *csi, esp_isp_processor_cfg_t *isp)
 {
+    /* Real wire format from TC358743 is RGB888 into the CSI controller. */
     csi->input_data_color_type = CAM_CTLR_COLOR_RGB888;
     csi->output_data_color_type = CAM_CTLR_COLOR_RGB888;
-    isp->input_data_color_type = ISP_COLOR_RGB888;
-    isp->output_data_color_type = ISP_COLOR_RGB888;
+    /*
+     * IDF 5.4: ISP_COLOR_RGB888 is rejected ("invalid input color space") because
+     * .flags.bypass_isp does not exist yet. Use RAW8 only to satisfy esp_isp_new_processor;
+     * we force hardware bypass with ISP.cntl.isp_en = 0 so ISP does not process pixels.
+     * On IDF 5.5+/6.x prefer ISP_COLOR_RGB888 + .flags.bypass_isp = true.
+     */
+    isp->input_data_color_type = ISP_COLOR_RAW8;
+    isp->output_data_color_type = ISP_COLOR_RAW8;
 }
 
 static void capture_configure_p4_csi_bridge(uint32_t hres, uint32_t vres)
@@ -254,8 +261,7 @@ capture_ctx_t *capture_hw_init_start(void)
         .byte_swap_en = false,
         .bk_buffer_dis = true,
     };
-    /* IDF 5.4: no .flags.bypass_isp; hardware bypass via ISP.cntl.isp_en = 0 below.
-     * IDF 5.5+/6.x can set .flags = { .bypass_isp = true, .byte_swap_en = false }. */
+    /* IDF 5.4: no .flags.bypass_isp; hardware bypass via ISP.cntl.isp_en = 0 below. */
     esp_isp_processor_cfg_t isp_cfg = {
         .clk_src = ISP_CLK_SRC_DEFAULT,
         .clk_hz = 80 * 1000000,
