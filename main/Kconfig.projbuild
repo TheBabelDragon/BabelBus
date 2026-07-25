@@ -5,7 +5,7 @@ menu "BabelBus HDMI → CSI"
     config P4KVM_TC358743_RST_GPIO
         int "TC358743 RESETN GPIO (active low; -1 if unused)"
         range -1 ENV_GPIO_RANGE_MAX
-        default 23
+        default -1
 
     config P4KVM_JPEG_QUALITY
         int "JPEG quality 1-100"
