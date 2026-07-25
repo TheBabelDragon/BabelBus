@@ -271,7 +271,8 @@ static void audio_worker_task(void *arg)
 static esp_err_t audio_get(httpd_req_t *req)
 {
     if (!i2s_audio_ready()) {
-        return httpd_resp_send_err(req, HTTPD_503_SERVICE_UNAVAILABLE, "audio disabled or not ready");
+        /* IDF 5.4 has no HTTPD_503_* enum; use custom status string. */
+        return httpd_resp_send_custom_err(req, "503 Service Unavailable", "audio disabled or not ready");
     }
     httpd_resp_set_type(req, "application/octet-stream");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -292,7 +293,7 @@ static esp_err_t audio_get(httpd_req_t *req)
 httpd_handle_t http_server_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_req_hdr_len = 8192;
+    /* max_req_hdr_len is IDF 5.5+; on 5.4 use Kconfig HTTPD_MAX_REQ_HDR_LEN instead */
     cfg.server_port = 80;
     cfg.stack_size = 20 * 1024;
     cfg.task_priority = tskIDLE_PRIORITY + 6;
