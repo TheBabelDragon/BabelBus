@@ -64,6 +64,9 @@ void tc358743_debug_bridge(tc358743_t *dev);
 
 void tc358743_debug_stall_extras(tc358743_t *dev);
 
+/** Always-on UART dump of CHIPID / HPD / PHY / CSI / timing (no ADV_DEBUG needed). */
+void tc358743_log_link_state(tc358743_t *dev);
+
 esp_err_t tc358743_set_streaming(tc358743_t *dev, bool on);
 
 esp_err_t tc358743_read_chip_id(tc358743_t *dev, uint16_t *chip_id);
