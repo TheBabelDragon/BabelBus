@@ -2,7 +2,7 @@
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * UYVY 4:2:2 CSI path — same packing Linux/BliKVM use with TC358743 by default.
+ * RGB888 CSI path — same as upstream jrowny/p4kvm.
  */
 #include "capture_priv.h"
 
@@ -30,7 +30,6 @@
 #include "esp_cam_ctlr_csi.h"
 #include "esp_ldo_regulator.h"
 #include "hal/mipi_csi_types.h"
-#include "hal/color_types.h"
 #include "soc/clk_tree_defs.h"
 #include "soc/isp_struct.h"
 #include "soc/mipi_csi_bridge_struct.h"
@@ -41,8 +40,8 @@
 static esp_cam_ctlr_handle_t s_cam;
 static isp_proc_handle_t s_isp_bypass;
 
-/* CSI-2 YUV422 8-bit (UYVY) user data type */
-static const uint32_t s_csi_expected_dt = 0x1Eu;
+/* CSI-2 RGB888 user data type */
+static const uint32_t s_csi_expected_dt = 0x24u;
 
 static capture_ctx_t s_cap;
 
@@ -109,12 +108,12 @@ void capture_debug_csi_timeout(capture_ctx_t *c, unsigned bpp, size_t fb_bytes)
              " ping=%d done_fb=%p",
              fb_bytes, gdma_64b, (unsigned)c->hres, (unsigned)c->vres, bpp, c->csi_get_new_irqs,
              c->csi_dma_done_irqs, c->ping_fb_idx, (void *)c->done_fb);
-    ESP_LOGW(CAPTURE_LOG_TAG, "  esp_cam: csi_transfer_size=%" PRIu32 "x64b; UYVY in_bpp=16 DT=0x1E", gdma_64b);
+    ESP_LOGW(CAPTURE_LOG_TAG, "  esp_cam: csi_transfer_size=%" PRIu32 "x64b; RGB888 in_bpp=24 DT=0x24", gdma_64b);
     {
         uint32_t dtc = MIPI_CSI_BRIDGE.data_type_cfg.val;
         unsigned lo = (unsigned)(dtc & 0x3fu);
         unsigned hi = (unsigned)((dtc >> 8) & 0x3fu);
-        ESP_LOGW(CAPTURE_LOG_TAG, "  BRG data_type filter min=0x%02x max=0x%02x (expect YUV422_8b=0x1E)", lo, hi);
+        ESP_LOGW(CAPTURE_LOG_TAG, "  BRG data_type filter min=0x%02x max=0x%02x (expect RGB888=0x24)", lo, hi);
     }
     ESP_LOGW(CAPTURE_LOG_TAG, "  BRG frame_cfg=0x%08" PRIx32 " (vadr=%" PRIu32 " hadr=%" PRIu32 ") host_ctrl=0x%08" PRIx32
              " dtype_reg=0x%08" PRIx32,
@@ -134,16 +133,15 @@ void capture_debug_csi_timeout(capture_ctx_t *c, unsigned bpp, size_t fb_bytes)
 
 unsigned capture_csi_bpp(void)
 {
-    return 16u; /* UYVY */
+    return 24u; /* RGB888 */
 }
 
 void capture_fill_esp_cam_color_types(esp_cam_ctlr_csi_config_t *csi, esp_isp_processor_cfg_t *isp)
 {
-    /* IDF 6.x uses explicit YUV422 packing enums */
-    csi->input_data_color_type = CAM_CTLR_COLOR_YUV422_UYVY;
-    csi->output_data_color_type = CAM_CTLR_COLOR_YUV422_UYVY;
-    isp->input_data_color_type = ISP_COLOR_YUV422;
-    isp->output_data_color_type = ISP_COLOR_YUV422;
+    csi->input_data_color_type = CAM_CTLR_COLOR_RGB888;
+    csi->output_data_color_type = CAM_CTLR_COLOR_RGB888;
+    isp->input_data_color_type = ISP_COLOR_RGB888;
+    isp->output_data_color_type = ISP_COLOR_RGB888;
 }
 
 static void capture_configure_p4_csi_bridge(uint32_t hres, uint32_t vres)
@@ -209,11 +207,12 @@ capture_ctx_t *capture_hw_init_start(void)
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus));
     ESP_ERROR_CHECK(tc358743_probe(i2c_bus, NULL, &s_cap.tc));
     ESP_ERROR_CHECK(tc358743_init_streaming(s_cap.tc));
-    tc358743_set_csi_uyvy422(s_cap.tc, true);
+    /* RGB888 path — do not force UYVY */
+    tc358743_set_csi_uyvy422(s_cap.tc, false);
 
     s_cap.hres = P4KVM_CSI_H_RES;
     s_cap.vres = P4KVM_CSI_V_RES;
-    s_cap.frame_bytes = (size_t)s_cap.hres * (size_t)s_cap.vres * 2u; /* UYVY */
+    s_cap.frame_bytes = (size_t)s_cap.hres * (size_t)s_cap.vres * 3u; /* RGB888 */
 
     size_t align = 0;
     ESP_ERROR_CHECK(esp_cache_get_alignment(MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA, &align));
@@ -232,7 +231,7 @@ capture_ctx_t *capture_hw_init_start(void)
     s_cap.csi_dma_done_irqs = 0;
     s_cap.csi_get_new_irqs = 0;
 
-    ESP_LOGI(CAPTURE_LOG_TAG, "CSI UYVY422 ring %u x %zu bytes (align %zu)", CAPTURE_FB_COUNT, s_cap.frame_bytes, align);
+    ESP_LOGI(CAPTURE_LOG_TAG, "CSI RGB888 ring %u x %zu bytes (align %zu)", CAPTURE_FB_COUNT, s_cap.frame_bytes, align);
 
     s_cap.csi_done_sem = xSemaphoreCreateCounting(32, 0);
     if (!s_cap.csi_done_sem) {
@@ -290,7 +289,7 @@ capture_ctx_t *capture_hw_init_start(void)
 
     capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
     ESP_ERROR_CHECK(esp_cam_ctlr_start(s_cam));
-    ESP_LOGI(CAPTURE_LOG_TAG, "esp_cam_ctlr_start (UYVY422 / DT 0x1E)");
+    ESP_LOGI(CAPTURE_LOG_TAG, "esp_cam_ctlr_start (RGB888 / DT 0x24)");
 
     return &s_cap;
 }
@@ -336,7 +335,7 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
         return ESP_ERR_INVALID_STATE;
     }
 
-    tc358743_set_csi_uyvy422(c->tc, true);
+    tc358743_set_csi_uyvy422(c->tc, false);
     capture_configure_p4_csi_bridge(c->hres, c->vres);
     ISP.cntl.isp_en = 0;
 
@@ -350,6 +349,6 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
         ESP_LOGE(CAPTURE_LOG_TAG, "esp_cam_ctlr_start after recover: %s", esp_err_to_name(er));
         return er;
     }
-    ESP_LOGI(CAPTURE_LOG_TAG, "esp_cam_ctlr_start after recover (UYVY)");
+    ESP_LOGI(CAPTURE_LOG_TAG, "esp_cam_ctlr_start after recover (RGB888)");
     return ESP_OK;
 }

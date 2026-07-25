@@ -91,8 +91,8 @@ void capture_mjpeg_run(capture_ctx_t *c)
         }
         jpeg_encode_cfg_t enc = {.width = c->hres,
                                  .height = c->vres,
-                                 .src_type = JPEG_ENCODE_IN_FORMAT_YUV422,
-                                 .sub_sample = JPEG_DOWN_SAMPLING_YUV422,
+                                 .src_type = JPEG_ENCODE_IN_FORMAT_RGB888,
+                                 .sub_sample = JPEG_DOWN_SAMPLING_YUV420,
                                  .image_quality = q};
         const uint32_t jpeg_in_bytes = (uint32_t)c->frame_bytes;
         uint32_t out_sz = 0;
