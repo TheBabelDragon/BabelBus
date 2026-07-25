@@ -14,11 +14,10 @@ menu "BabelBus HDMI → CSI"
 
     config P4KVM_TC358743_ADV_DEBUG
         bool "Advanced TC358743 debugging (verbose stall / bridge logs + extra I2C reads)"
-        default n
+        default y
         help
             When enabled, CSI frame timeouts log extra TC358743 register state, AVI
             infoframe dumps, and periodic bridge status. Adds I2C traffic on error paths.
-            Boot-time SYS_STATUS lines from init are unchanged.
 
     config P4KVM_ETH_ENABLE
         bool "Enable Ethernet (DHCP)"
