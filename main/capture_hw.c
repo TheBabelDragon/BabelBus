@@ -2,7 +2,7 @@
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * RGB888 CSI path — same as upstream jrowny/p4kvm.
+ * UYVY 4:2:2 CSI path — ESP32-P4 CSI accepts UYVY from TC358743.
  */
 #include "capture_priv.h"
 
@@ -30,6 +30,7 @@
 #include "esp_cam_ctlr_csi.h"
 #include "esp_ldo_regulator.h"
 #include "hal/mipi_csi_types.h"
+#include "hal/color_types.h"
 #include "soc/clk_tree_defs.h"
 #include "soc/isp_struct.h"
 #include "soc/mipi_csi_bridge_struct.h"
@@ -41,8 +42,8 @@ static esp_cam_ctlr_handle_t s_cam;
 static isp_proc_handle_t s_isp_bypass;
 static bool s_cam_started;
 
-/* CSI-2 RGB888 user data type */
-static const uint32_t s_csi_expected_dt = 0x24u;
+/* CSI-2 YUV422 8-bit (UYVY) user data type */
+static const uint32_t s_csi_expected_dt = 0x1Eu;
 
 static capture_ctx_t s_cap;
 
@@ -106,14 +107,10 @@ static void wait_tc358743_pixel_stream(tc358743_t *tc, uint32_t timeout_ms)
     tc358743_debug_stall_extras(tc);
 }
 
-/**
- * Harden against single-shot HPD/EDID failures (common when RESETN is not
- * wired and some sources need several hotplug edges before enabling TMDS).
- */
 static void hardened_hdmi_bringup(tc358743_t *tc)
 {
     const int attempts = 4;
-    ESP_LOGI(CAPTURE_LOG_TAG, "Hardened HDMI bring-up: %d HPD/EDID cycles", attempts);
+    ESP_LOGI(CAPTURE_LOG_TAG, "Hardened HDMI bring-up: %d HPD/EDID cycles (UYVY path)", attempts);
 
     ESP_ERROR_CHECK(tc358743_enable_hdmi_output(tc));
 
@@ -126,7 +123,6 @@ static void hardened_hdmi_bringup(tc358743_t *tc)
             if (er != ESP_OK) {
                 ESP_LOGW(CAPTURE_LOG_TAG, "hotplug_reset: %s", esp_err_to_name(er));
             }
-            /* Extra settle for stubborn sources after HPD edge */
             vTaskDelay(pdMS_TO_TICKS(300));
         }
 
@@ -135,13 +131,12 @@ static void hardened_hdmi_bringup(tc358743_t *tc)
             ESP_LOGI(CAPTURE_LOG_TAG, "HDMI locked on attempt %d/%d", i, attempts);
             return;
         }
-        ESP_LOGW(CAPTURE_LOG_TAG, "Attempt %d/%d: still no TMDS (ruling out flaky single HPD)", i, attempts);
+        ESP_LOGW(CAPTURE_LOG_TAG, "Attempt %d/%d: still no TMDS", i, attempts);
         tc358743_debug_bridge(tc);
         tc358743_debug_stall_extras(tc);
     }
 
-    ESP_LOGW(CAPTURE_LOG_TAG,
-             "All %d HPD/EDID attempts failed — not a one-shot handshake glitch", attempts);
+    ESP_LOGW(CAPTURE_LOG_TAG, "All %d HPD/EDID attempts failed", attempts);
 }
 
 void capture_debug_csi_timeout(capture_ctx_t *c, unsigned bpp, size_t fb_bytes)
@@ -158,12 +153,12 @@ void capture_debug_csi_timeout(capture_ctx_t *c, unsigned bpp, size_t fb_bytes)
              " ping=%d done_fb=%p",
              fb_bytes, gdma_64b, (unsigned)c->hres, (unsigned)c->vres, bpp, c->csi_get_new_irqs,
              c->csi_dma_done_irqs, c->ping_fb_idx, (void *)c->done_fb);
-    ESP_LOGW(CAPTURE_LOG_TAG, "  esp_cam: csi_transfer_size=%" PRIu32 "x64b; RGB888 in_bpp=24 DT=0x24", gdma_64b);
+    ESP_LOGW(CAPTURE_LOG_TAG, "  esp_cam: csi_transfer_size=%" PRIu32 "x64b; UYVY in_bpp=16 DT=0x1E", gdma_64b);
     {
         uint32_t dtc = MIPI_CSI_BRIDGE.data_type_cfg.val;
         unsigned lo = (unsigned)(dtc & 0x3fu);
         unsigned hi = (unsigned)((dtc >> 8) & 0x3fu);
-        ESP_LOGW(CAPTURE_LOG_TAG, "  BRG data_type filter min=0x%02x max=0x%02x (expect RGB888=0x24)", lo, hi);
+        ESP_LOGW(CAPTURE_LOG_TAG, "  BRG data_type filter min=0x%02x max=0x%02x (expect YUV422_8b=0x1E)", lo, hi);
     }
     ESP_LOGW(CAPTURE_LOG_TAG, "  BRG frame_cfg=0x%08" PRIx32 " (vadr=%" PRIu32 " hadr=%" PRIu32 ") host_ctrl=0x%08" PRIx32
              " dtype_reg=0x%08" PRIx32,
@@ -188,15 +183,15 @@ void capture_debug_csi_timeout(capture_ctx_t *c, unsigned bpp, size_t fb_bytes)
 
 unsigned capture_csi_bpp(void)
 {
-    return 24u; /* RGB888 */
+    return 16u; /* UYVY */
 }
 
 void capture_fill_esp_cam_color_types(esp_cam_ctlr_csi_config_t *csi, esp_isp_processor_cfg_t *isp)
 {
-    csi->input_data_color_type = CAM_CTLR_COLOR_RGB888;
-    csi->output_data_color_type = CAM_CTLR_COLOR_RGB888;
-    isp->input_data_color_type = ISP_COLOR_RGB888;
-    isp->output_data_color_type = ISP_COLOR_RGB888;
+    csi->input_data_color_type = CAM_CTLR_COLOR_YUV422_UYVY;
+    csi->output_data_color_type = CAM_CTLR_COLOR_YUV422_UYVY;
+    isp->input_data_color_type = ISP_COLOR_YUV422;
+    isp->output_data_color_type = ISP_COLOR_YUV422;
 }
 
 static void capture_configure_p4_csi_bridge(uint32_t hres, uint32_t vres)
@@ -262,11 +257,11 @@ capture_ctx_t *capture_hw_init_start(void)
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus));
     ESP_ERROR_CHECK(tc358743_probe(i2c_bus, NULL, &s_cap.tc));
     ESP_ERROR_CHECK(tc358743_init_streaming(s_cap.tc));
-    tc358743_set_csi_uyvy422(s_cap.tc, false);
+    tc358743_set_csi_uyvy422(s_cap.tc, true);
 
     s_cap.hres = P4KVM_CSI_H_RES;
     s_cap.vres = P4KVM_CSI_V_RES;
-    s_cap.frame_bytes = (size_t)s_cap.hres * (size_t)s_cap.vres * 3u;
+    s_cap.frame_bytes = (size_t)s_cap.hres * (size_t)s_cap.vres * 2u; /* UYVY */
 
     size_t align = 0;
     ESP_ERROR_CHECK(esp_cache_get_alignment(MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA, &align));
@@ -285,7 +280,7 @@ capture_ctx_t *capture_hw_init_start(void)
     s_cap.csi_dma_done_irqs = 0;
     s_cap.csi_get_new_irqs = 0;
 
-    ESP_LOGI(CAPTURE_LOG_TAG, "CSI RGB888 ring %u x %zu bytes (align %zu)", CAPTURE_FB_COUNT, s_cap.frame_bytes, align);
+    ESP_LOGI(CAPTURE_LOG_TAG, "CSI UYVY422 ring %u x %zu bytes (align %zu)", CAPTURE_FB_COUNT, s_cap.frame_bytes, align);
 
     s_cap.csi_done_sem = xSemaphoreCreateCounting(32, 0);
     if (!s_cap.csi_done_sem) {
@@ -334,8 +329,9 @@ capture_ctx_t *capture_hw_init_start(void)
     ISP.cntl.isp_en = 0;
     capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
 
-    /* Multi-cycle HPD/EDID — rules out one-shot handshake issues */
     hardened_hdmi_bringup(s_cap.tc);
+    /* Re-apply UYVY after HPD cycles (init defaults to RGB then we force UYVY) */
+    tc358743_set_csi_uyvy422(s_cap.tc, true);
 
     if (!tc_has_pixel_stream(s_cap.tc)) {
         ESP_LOGW(CAPTURE_LOG_TAG, "No TMDS after hardened bring-up — starting CSI anyway");
@@ -344,7 +340,7 @@ capture_ctx_t *capture_hw_init_start(void)
     capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
     ESP_ERROR_CHECK(esp_cam_ctlr_start(s_cam));
     s_cam_started = true;
-    ESP_LOGI(CAPTURE_LOG_TAG, "esp_cam_ctlr_start (RGB888 / DT 0x24)");
+    ESP_LOGI(CAPTURE_LOG_TAG, "esp_cam_ctlr_start (UYVY422 / DT 0x1E)");
 
     return &s_cap;
 }
@@ -378,7 +374,6 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     capture_drain_csi_done_sem(c->csi_done_sem);
 
     if (!locked) {
-        /* Same hardened multi-cycle path as boot */
         for (int i = 1; i <= 3; i++) {
             ESP_LOGI(CAPTURE_LOG_TAG, "Recover HPD attempt %d/3", i);
             esp_err_t er = tc358743_hdmi_hotplug_reset(c->tc);
@@ -406,7 +401,7 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
         return ESP_ERR_INVALID_STATE;
     }
 
-    tc358743_set_csi_uyvy422(c->tc, false);
+    tc358743_set_csi_uyvy422(c->tc, true);
     capture_configure_p4_csi_bridge(c->hres, c->vres);
     ISP.cntl.isp_en = 0;
 
@@ -421,6 +416,6 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
         return er;
     }
     s_cam_started = true;
-    ESP_LOGI(CAPTURE_LOG_TAG, "esp_cam_ctlr_start after recover (RGB888)");
+    ESP_LOGI(CAPTURE_LOG_TAG, "esp_cam_ctlr_start after recover (UYVY)");
     return ESP_OK;
 }
