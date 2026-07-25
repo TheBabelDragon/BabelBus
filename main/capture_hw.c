@@ -72,13 +72,13 @@ static void wait_tc358743_pixel_stream(tc358743_t *tc, uint32_t timeout_ms)
     while (waited < timeout_ms) {
         uint8_t st = 0;
         if (tc358743_sys_status(tc, &st) == ESP_OK && (st & 0x02) != 0 && (st & 0x80) != 0) {
-            ESP_LOGI(CAPTURE_LOG_TAG, "HDMI ready SYS_STATUS=0x%02x after %u ms", st, waited);
+            ESP_LOGI(CAPTURE_LOG_TAG, "HDMI ready SYS_STATUS=0x%02x after %" PRIu32 " ms", st, waited);
             return;
         }
         vTaskDelay(pdMS_TO_TICKS(step));
         waited += step;
     }
-    ESP_LOGW(CAPTURE_LOG_TAG, "HDMI lock wait %u ms - starting CSI anyway", (unsigned)timeout_ms);
+    ESP_LOGW(CAPTURE_LOG_TAG, "HDMI lock wait %" PRIu32 " ms - starting CSI anyway", timeout_ms);
 }
 
 void capture_debug_csi_timeout(capture_ctx_t *c, unsigned bpp, size_t fb_bytes)
@@ -91,16 +91,16 @@ void capture_debug_csi_timeout(capture_ctx_t *c, unsigned bpp, size_t fb_bytes)
     unsigned isp_ls = (unsigned)((isp_fc >> 29) & 1u);
     unsigned isp_le = (unsigned)((isp_fc >> 30) & 1u);
     ESP_LOGW(CAPTURE_LOG_TAG,
-             "CSI stall: fb=%zu B expect, GDMA size=%" PRIu32 "×64b for %ux%u@%ubpp | get_new=%" PRIu32 " done=%" PRIu32
+             "CSI stall: fb=%zu B expect, GDMA size=%" PRIu32 "x64b for %ux%u@%ubpp | get_new=%" PRIu32 " done=%" PRIu32
              " ping=%d done_fb=%p",
              fb_bytes, gdma_64b, (unsigned)c->hres, (unsigned)c->vres, bpp, c->csi_get_new_irqs,
              c->csi_dma_done_irqs, c->ping_fb_idx, (void *)c->done_fb);
-    ESP_LOGW(CAPTURE_LOG_TAG, "  esp_cam: csi_transfer_size=%" PRIu32 "×64b (=h×v×in_bpp/64); RGB888 in_bpp=24, wire datatype must match", gdma_64b);
+    ESP_LOGW(CAPTURE_LOG_TAG, "  esp_cam: csi_transfer_size=%" PRIu32 "x64b (=h*v*in_bpp/64); RGB888 in_bpp=24, wire datatype must match", gdma_64b);
     {
         uint32_t dtc = MIPI_CSI_BRIDGE.data_type_cfg.val;
         unsigned lo = (unsigned)(dtc & 0x3fu);
         unsigned hi = (unsigned)((dtc >> 8) & 0x3fu);
-        ESP_LOGW(CAPTURE_LOG_TAG, "  BRG data_type filter min=0x%02x max=0x%02x (CSI-2 user: RGB888=0x24 YUV422_8b=0x1E …)", lo, hi);
+        ESP_LOGW(CAPTURE_LOG_TAG, "  BRG data_type filter min=0x%02x max=0x%02x (CSI-2 user: RGB888=0x24 YUV422_8b=0x1E)", lo, hi);
     }
     ESP_LOGW(CAPTURE_LOG_TAG, "  BRG frame_cfg=0x%08" PRIx32 " (vadr=%" PRIu32 " hadr=%" PRIu32 ") host_ctrl=0x%08" PRIx32
              " dtype_reg=0x%08" PRIx32,
@@ -221,7 +221,7 @@ capture_ctx_t *capture_hw_init_start(void)
     const uint32_t caps = MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
     uint8_t *blk = heap_caps_aligned_calloc(align, CAPTURE_FB_COUNT, s_cap.frame_bytes, caps);
     if (!blk) {
-        ESP_LOGE(CAPTURE_LOG_TAG, "CSI frame buffer alloc failed (%u×%zu bytes). Enable PSRAM or reduce capture resolution.",
+        ESP_LOGE(CAPTURE_LOG_TAG, "CSI frame buffer alloc failed (%u x %zu bytes). Enable PSRAM or reduce capture resolution.",
                  CAPTURE_FB_COUNT, s_cap.frame_bytes);
         vTaskDelete(NULL);
         return NULL;
@@ -234,7 +234,7 @@ capture_ctx_t *capture_hw_init_start(void)
     s_cap.csi_dma_done_irqs = 0;
     s_cap.csi_get_new_irqs = 0;
 
-    ESP_LOGI(CAPTURE_LOG_TAG, "CSI 24bpp BGR ring %u×%zu bytes (align %zu)", CAPTURE_FB_COUNT, s_cap.frame_bytes, align);
+    ESP_LOGI(CAPTURE_LOG_TAG, "CSI 24bpp BGR ring %u x %zu bytes (align %zu)", CAPTURE_FB_COUNT, s_cap.frame_bytes, align);
 
     s_cap.csi_done_sem = xSemaphoreCreateCounting(32, 0);
     if (!s_cap.csi_done_sem) {
@@ -254,6 +254,8 @@ capture_ctx_t *capture_hw_init_start(void)
         .byte_swap_en = false,
         .bk_buffer_dis = true,
     };
+    /* IDF 5.4: no .flags.bypass_isp; hardware bypass via ISP.cntl.isp_en = 0 below.
+     * IDF 5.5+/6.x can set .flags = { .bypass_isp = true, .byte_swap_en = false }. */
     esp_isp_processor_cfg_t isp_cfg = {
         .clk_src = ISP_CLK_SRC_DEFAULT,
         .clk_hz = 80 * 1000000,
@@ -266,7 +268,6 @@ capture_ctx_t *capture_hw_init_start(void)
         .v_res = s_cap.vres,
         .bayer_order = COLOR_RAW_ELEMENT_ORDER_BGGR,
         .intr_priority = 0,
-        .flags = {.bypass_isp = true, .byte_swap_en = false},
     };
     capture_fill_esp_cam_color_types(&csi_cfg, &isp_cfg);
 
@@ -307,7 +308,7 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     ESP_RETURN_ON_FALSE(c && c->tc && c->csi_done_sem, ESP_ERR_INVALID_ARG, CAPTURE_LOG_TAG, "ctx");
     ESP_RETURN_ON_FALSE(s_cam, ESP_ERR_INVALID_STATE, CAPTURE_LOG_TAG, "cam");
 
-    ESP_LOGW(CAPTURE_LOG_TAG, "HDMI/camera recover: esp_cam stop → HDMI hotplug → MIPI reapply → esp_cam start");
+    ESP_LOGW(CAPTURE_LOG_TAG, "HDMI/camera recover: esp_cam stop -> HDMI hotplug -> MIPI reapply -> esp_cam start");
 
     esp_err_t er = esp_cam_ctlr_stop(s_cam);
     if (er == ESP_ERR_INVALID_STATE) {
