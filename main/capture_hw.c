@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * UYVY 4:2:2 CSI path — same packing Linux/BliKVM use with TC358743 by default.
- * RGB888 (DT 0x24) was locking HDMI but never completing GDMA on this board.
  */
 #include "capture_priv.h"
 
@@ -140,8 +139,9 @@ unsigned capture_csi_bpp(void)
 
 void capture_fill_esp_cam_color_types(esp_cam_ctlr_csi_config_t *csi, esp_isp_processor_cfg_t *isp)
 {
-    csi->input_data_color_type = CAM_CTLR_COLOR_YUV422;
-    csi->output_data_color_type = CAM_CTLR_COLOR_YUV422;
+    /* IDF 6.x uses explicit YUV422 packing enums */
+    csi->input_data_color_type = CAM_CTLR_COLOR_YUV422_UYVY;
+    csi->output_data_color_type = CAM_CTLR_COLOR_YUV422_UYVY;
     isp->input_data_color_type = ISP_COLOR_YUV422;
     isp->output_data_color_type = ISP_COLOR_YUV422;
 }
@@ -209,7 +209,6 @@ capture_ctx_t *capture_hw_init_start(void)
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus));
     ESP_ERROR_CHECK(tc358743_probe(i2c_bus, NULL, &s_cap.tc));
     ESP_ERROR_CHECK(tc358743_init_streaming(s_cap.tc));
-    /* BliKVM / Linux default packing for this bridge */
     tc358743_set_csi_uyvy422(s_cap.tc, true);
 
     s_cap.hres = P4KVM_CSI_H_RES;
@@ -310,7 +309,6 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     ESP_RETURN_ON_FALSE(c && c->tc && c->csi_done_sem, ESP_ERR_INVALID_ARG, CAPTURE_LOG_TAG, "ctx");
     ESP_RETURN_ON_FALSE(s_cam, ESP_ERR_INVALID_STATE, CAPTURE_LOG_TAG, "cam");
 
-    /* Soft recover: re-raise HPD only if we already lost TMDS. Avoid killing a good lock. */
     bool locked = tc_has_pixel_stream(c->tc);
     ESP_LOGW(CAPTURE_LOG_TAG, "HDMI recover (locked=%d)", (int)locked);
 
@@ -327,7 +325,6 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
         }
         wait_tc358743_pixel_stream(c->tc, 10000);
     } else {
-        /* Keep HPD high; only re-kick MIPI CSI TX */
         er = tc358743_reapply_csi_path_after_hdmi(c->tc);
         if (er != ESP_OK) {
             ESP_LOGW(CAPTURE_LOG_TAG, "reapply_csi: %s", esp_err_to_name(er));
