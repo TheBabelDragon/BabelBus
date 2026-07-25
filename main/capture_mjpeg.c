@@ -89,11 +89,10 @@ void capture_mjpeg_run(capture_ctx_t *c)
         } else if (q > 100u) {
             q = 100u;
         }
-        /* CSI delivers packed UYVY 4:2:2; encoder chroma-downsamples to 4:2:0. */
         jpeg_encode_cfg_t enc = {.width = c->hres,
                                  .height = c->vres,
                                  .src_type = JPEG_ENCODE_IN_FORMAT_YUV422,
-                                 .sub_sample = JPEG_DOWN_SAMPLING_YUV420,
+                                 .sub_sample = JPEG_DOWN_SAMPLING_YUV422,
                                  .image_quality = q};
         const uint32_t jpeg_in_bytes = (uint32_t)c->frame_bytes;
         uint32_t out_sz = 0;
