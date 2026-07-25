@@ -14,4 +14,9 @@
 #define P4KVM_CSI_H_RES 1920u
 #define P4KVM_CSI_V_RES 1080u
 
-#define P4KVM_MIPI_LANE_MBPS 972
+/*
+ * 1080p30 RGB888 ≈ 1.5 Gbps → 972 Mbps/lane x2 is enough.
+ * 1080p60 RGB888 ≈ 3.0 Gbps → need ~1500 Mbps/lane x2.
+ * EDID is now 1080p60-preferred; match the CSI link budget.
+ */
+#define P4KVM_MIPI_LANE_MBPS 1500
