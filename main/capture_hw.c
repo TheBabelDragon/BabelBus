@@ -71,17 +71,32 @@ static void i2c_bus_scan(i2c_master_bus_handle_t bus)
 {
     ESP_LOGI(CAPTURE_LOG_TAG, "I2C scan...");
     int found = 0;
+    bool saw_tc = false;
+    bool saw_codec = false;
     for (uint16_t addr = 1; addr < 0x7f; addr++) {
         esp_err_t er = i2c_master_probe(bus, addr, 50);
         if (er == ESP_OK) {
             ESP_LOGI(CAPTURE_LOG_TAG, "  ACK at 0x%02x", (unsigned)addr);
             found++;
+            if (addr == TC358743_I2C_ADDR) {
+                saw_tc = true;
+            }
+            if (addr == 0x18) {
+                saw_codec = true;
+            }
         }
     }
     if (found == 0) {
-        ESP_LOGE(CAPTURE_LOG_TAG, "I2C scan: no devices — SDA/SCL path dead");
+        ESP_LOGE(CAPTURE_LOG_TAG, "I2C scan: no devices — SDA/SCL path dead (GPIO7/8, pull-ups, FPC)");
     } else {
         ESP_LOGI(CAPTURE_LOG_TAG, "I2C scan: %d device(s)", found);
+    }
+    if (!saw_tc) {
+        ESP_LOGE(CAPTURE_LOG_TAG,
+                 "TC358743 (0x0F) NOT on bus! Onboard ES8311 %s. "
+                 "Reseat the CSI FPC, check RESETN (GPIO23), power to the HDMI adapter, "
+                 "and that the ribbon is the large MIPI-CSI connector (Pi-camera style).",
+                 saw_codec ? "is present (board I2C OK)" : "also missing");
     }
 }
 
@@ -213,7 +228,10 @@ capture_ctx_t *capture_hw_init_start(void)
         .glitch_ignore_cnt = 7,
         .intr_priority = 0,
         .trans_queue_depth = 0,
-        .flags = {.enable_internal_pullup = false},
+        /* Critical: CSI FPC / TC358743 path often has no strong external pull-ups.
+         * Without these the remote chip never ACKs while onboard 0x18 still does,
+         * producing the classic mono-fill 0xDF SYS_STATUS / CHIPID spam. */
+        .flags = {.enable_internal_pullup = true},
     };
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus));
     i2c_bus_scan(i2c_bus);
@@ -222,6 +240,18 @@ capture_ctx_t *capture_hw_init_start(void)
     ESP_ERROR_CHECK(tc358743_init_streaming(s_cap.tc));
     tc358743_set_csi_uyvy422(s_cap.tc, true);
     tc358743_log_link_state(s_cap.tc);
+
+    /* Early hard fail if I2C is still garbage — no point starting CSI. */
+    {
+        uint16_t id = 0;
+        (void)tc358743_read_chip_id(s_cap.tc, &id);
+        if ((id & 0xffu) == ((id >> 8) & 0xffu) && (id & 0xffu) != 0) {
+            ESP_LOGE(CAPTURE_LOG_TAG,
+                     "TC358743 CHIPID still mono-fill 0x%04x after init — I2C not talking to the bridge. "
+                     "Fix FPC / RESETN / power before CSI will ever produce frames.",
+                     id);
+        }
+    }
 
     ESP_ERROR_CHECK(tc358743_enable_hdmi_output(s_cap.tc));
     wait_hdmi_lock(s_cap.tc, 5000);
