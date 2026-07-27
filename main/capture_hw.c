@@ -107,13 +107,14 @@ static bool tc_locked(tc358743_t *tc)
     if (st == 0xffu || st == 0xdfu || st == 0x7fu || st == 0x9fu || st == 0xf7u || st == 0xfdu) {
         return false;
     }
-    return ((st & 0x02) != 0) && ((st & 0x80) != 0);
+    /* TMDS (bit1) + SCDT (bit3) + SYNC (bit7). Ignore DDC5V — often sticky. */
+    return ((st & 0x02) != 0) && ((st & 0x08) != 0) && ((st & 0x80) != 0);
 }
 
 static void wait_hdmi_lock(tc358743_t *tc, uint32_t timeout_ms)
 {
     uint32_t waited = 0;
-    ESP_LOGI(CAPTURE_LOG_TAG, "wait HDMI TMDS+SYNC up to %" PRIu32 " ms", timeout_ms);
+    ESP_LOGI(CAPTURE_LOG_TAG, "wait HDMI TMDS+SCDT+SYNC up to %" PRIu32 " ms", timeout_ms);
     while (waited < timeout_ms) {
         if (tc_locked(tc)) {
             uint8_t st = 0;
@@ -390,9 +391,12 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     const bool locked = tc_locked(c->tc);
 
     /*
-     * Even when HDMI is still locked, a long run can leave esp_cam with no
-     * queued buffers (done stuck). Always stop → drain → start the cam.
-     * Only do HPD when HDMI is actually unlocked.
+     * Soft path (HDMI still looks locked):
+     *   cam stop → drain → stream re-assert → cam start
+     * Do NOT call set_csi_lanes / CTXRST — that kills a working TX mid-run.
+     *
+     * Hard path (HDMI unlocked):
+     *   HPD cycle + full CSI reapply.
      */
     ESP_LOGW(CAPTURE_LOG_TAG, "CSI recover (locked=%d): cam stop → requeue → start",
              (int)locked);
@@ -412,8 +416,7 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
             after_hdmi_lock(c->tc);
         }
     } else {
-        tc358743_set_csi_uyvy422(c->tc, false);
-        (void)tc358743_reapply_csi_path_after_hdmi(c->tc);
+        /* Keep CSI block warm — only re-open video FIFO + continuous clock. */
         (void)tc358743_set_streaming(c->tc, true);
     }
 
