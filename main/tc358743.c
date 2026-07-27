@@ -2,8 +2,8 @@
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * CRITICAL: set_csi_lanes() does CTXRST — color space + VBUFEN must be
- * programmed AFTER that, or CONFCTL/YFmt is wiped and CSI carries blank.
+ * Colorbar forced after full CSI arm (last CONFCTL write). If still solid grey,
+ * CSI/JPEG path is wrong; if stripes, HDMI input is blank.
  */
 #include "tc358743.h"
 
@@ -33,6 +33,7 @@ static const char *TAG = "tc358743";
 #define CONFCTL 0x0004
 #define MASK_YCBCRFMT 0x00c0
 #define MASK_YCBCRFMT_422_8_BIT 0x00c0
+#define MASK_YCBCRFMT_COLORBAR 0x0080
 #define MASK_VBUFEN 0x0001
 #define MASK_ABUFEN 0x0002
 #define MASK_AUDCHNUM_2 0x0c00
@@ -230,6 +231,11 @@ static const char *TAG = "tc358743";
 #define DIV_MODE 0x8612
 #define SET_DIV_DLY_MS(ms) ((ms) & 0xff)
 
+/* 1 = chip colorbar (stripes). 0 = live HDMI. */
+#ifndef BABELBUS_FORCE_COLORBAR
+#define BABELBUS_FORCE_COLORBAR 1
+#endif
+
 struct tc358743 {
     i2c_master_dev_handle_t i2c;
     tc358743_cfg_t cfg;
@@ -336,11 +342,13 @@ static void sleep_mode(tc358743_t *d, bool enable)
     wr16_and_or(d, SYSCTL, (uint16_t)~MASK_SLEEP, enable ? MASK_SLEEP : 0);
 }
 
-static void csi_force_contclk(tc358743_t *d)
+static void csi_kick_start(tc358743_t *d)
 {
+    /* Continuous clock: empirically required on this board for dma_done > 0. */
     wr32(d, TXOPTIONCNTRL, 0);
     wr32(d, CSI_START, MASK_STRT);
     wr32(d, TXOPTIONCNTRL, MASK_CONTCLKMODE);
+    wr32(d, CSI_START, MASK_STRT);
 }
 
 static void apply_hdmi_or_dvi(tc358743_t *d)
@@ -363,9 +371,6 @@ static void enable_stream(tc358743_t *d, bool enable)
     }
     wr16_and_or(d, CONFCTL, (uint16_t) ~(MASK_VBUFEN | MASK_ABUFEN),
                 enable ? (MASK_VBUFEN | MASK_ABUFEN) : 0);
-    if (enable) {
-        csi_force_contclk(d);
-    }
 }
 
 static void set_ref_clk(tc358743_t *d)
@@ -562,7 +567,6 @@ static void set_csi_lanes(tc358743_t *d, unsigned lanes)
     wr32(d, TXOPTIONCNTRL, 0);
     wr32(d, STARTCNTRL, MASK_START);
     wr32(d, CSI_START, MASK_STRT);
-    wr32(d, TXOPTIONCNTRL, MASK_CONTCLKMODE);
     uint32_t nol = (lanes == 4) ? MASK_NOL_4 : (lanes == 3) ? MASK_NOL_3 : (lanes == 2) ? MASK_NOL_2 : MASK_NOL_1;
     wr32(d, CSI_CONFW, MASK_MODE_SET | MASK_ADDRESS_CSI_CONTROL | MASK_CSI_MODE | MASK_TXHSMD | nol);
     wr32(d, CSI_CONFW, MASK_MODE_SET | MASK_ADDRESS_CSI_ERR_INTENA | MASK_TXBRK | MASK_QUNK | MASK_WCER | MASK_INER);
@@ -587,7 +591,10 @@ static void edid_write_builtin(tc358743_t *d)
     ESP_LOGI(TAG, "EDID loaded (%u bytes)", (unsigned)edid_len);
 }
 
-/** Full CSI bring-up AFTER any CTXRST: lanes → color → unmute/VBUFEN → contclk. */
+/**
+ * Full arm: CTXRST → lanes → color → VBUFEN → contclk → optional colorbar LAST.
+ * Colorbar must be the final CONFCTL YFmt write or CTXRST/color setup clears it.
+ */
 static void csi_path_arm(tc358743_t *d)
 {
     set_csi_lanes(d, d->cfg.lanes);
@@ -595,7 +602,17 @@ static void csi_path_arm(tc358743_t *d)
     apply_csi_color_space(d);
     enable_stream(d, true);
     wr8(d, VI_MUTE, 0);
-    csi_force_contclk(d);
+    csi_kick_start(d);
+
+#if BABELBUS_FORCE_COLORBAR
+    /* LAST write: replace HDMI pixels with internal stripes. */
+    wr16_and_or(d, CONFCTL, (uint16_t)~MASK_YCBCRFMT, MASK_YCBCRFMT_COLORBAR);
+    wr16_and_or(d, CONFCTL, (uint16_t) ~(MASK_VBUFEN | MASK_ABUFEN), MASK_VBUFEN | MASK_ABUFEN);
+    wr8(d, VI_MUTE, 0);
+    csi_kick_start(d);
+    ESP_LOGW(TAG, "COLORBAR forced (YFmt=2) — expect stripes if CSI path is good");
+#endif
+
     uint16_t conf = rd16(d, CONFCTL);
     ESP_LOGI(TAG, "CSI armed CONFCTL=0x%04x VBUFEN=%u YFmt=%u",
              conf, (unsigned)(conf & 1u), (unsigned)((conf >> 6) & 3u));
@@ -662,8 +679,8 @@ esp_err_t tc358743_init_streaming(tc358743_t *d)
     enable_stream(d, false);
     set_pll(d);
     d->csi_uyvy422 = false;
-    csi_path_arm(d);
-    enable_stream(d, false);
+    set_csi_lanes(d, d->cfg.lanes);
+    apply_csi_color_space(d);
     wr16(d, INTSTATUS, 0xffff);
     wr16(d, INTMASK, (uint16_t)(~(MASK_HDMI_MSK | MASK_CSI_MSK) & 0xffff));
     tc358743_debug_status(d);
@@ -673,8 +690,10 @@ esp_err_t tc358743_init_streaming(tc358743_t *d)
 esp_err_t tc358743_enable_hdmi_output(tc358743_t *d)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
-    hpd_set(d, true);
+    enable_stream(d, true);
     vTaskDelay(pdMS_TO_TICKS(150));
+    hpd_set(d, true);
+    vTaskDelay(pdMS_TO_TICKS(50));
     csi_path_arm(d);
     ESP_LOGI(TAG, "HPD + CSI path armed");
     tc358743_debug_status(d);
@@ -722,7 +741,7 @@ esp_err_t tc358743_set_streaming(tc358743_t *d, bool on)
     if (on) {
         enable_stream(d, true);
         wr8(d, VI_MUTE, 0);
-        csi_force_contclk(d);
+        csi_kick_start(d);
     } else {
         enable_stream(d, false);
     }
