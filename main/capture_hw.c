@@ -179,7 +179,8 @@ static void after_hdmi_lock(tc358743_t *tc)
 void capture_debug_csi_timeout(capture_ctx_t *c, unsigned bpp, size_t fb_bytes)
 {
     (void)bpp;
-    ESP_LOGW(CAPTURE_LOG_TAG, "CSI stall done=%" PRIu32 " fb=%zu", c->csi_dma_done_irqs, fb_bytes);
+    ESP_LOGW(CAPTURE_LOG_TAG, "CSI stall done=%" PRIu32 " get_new=%" PRIu32 " fb=%zu",
+             c->csi_dma_done_irqs, c->csi_get_new_irqs, fb_bytes);
     if (c && c->tc) {
         tc358743_debug_status(c->tc);
         tc358743_log_link_state(c->tc);
@@ -336,7 +337,8 @@ capture_ctx_t *capture_hw_init_start(void)
         .lane_bit_rate_mbps = P4KVM_MIPI_LANE_MBPS,
         .queue_items = CAPTURE_FB_COUNT,
         .byte_swap_en = false,
-        .bk_buffer_dis = true,
+        /* Keep driver backup buffer so a missed get_new cannot assert. */
+        .bk_buffer_dis = false,
     };
     esp_isp_processor_cfg_t isp_cfg = {
         .clk_src = ISP_CLK_SRC_DEFAULT,
@@ -371,6 +373,8 @@ capture_ctx_t *capture_hw_init_start(void)
 
     ESP_ERROR_CHECK(esp_cam_ctlr_start(s_cam));
     s_cam_started = true;
+    /* Final stream assert after RX is armed. */
+    (void)tc358743_set_streaming(s_cap.tc, true);
     ESP_LOGI(CAPTURE_LOG_TAG, "CSI started %ux%u UYVY fb=%zu", (unsigned)s_cap.hres,
              (unsigned)s_cap.vres, s_cap.frame_bytes);
     return &s_cap;
@@ -384,35 +388,18 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
 
     if (locked) {
         /*
-         * HDMI is fine — do NOT HPD-cycle (that drops TMDS and undoes progress).
-         * Soft kick: re-enable stream + CSI TX, retune P4 bridge, restart cam if needed.
+         * HDMI OK and we already got frames (or almost). Do NOT:
+         *  - HPD cycle
+         *  - CTXRST / full CSI lane reprogram (reapply_csi_path)
+         *  - esp_cam stop/start
+         * Those all break continuous MIPI after the first dma_done.
+         * Only re-assert video mute off + VBUFEN + CSI_START.
          */
-        ESP_LOGW(CAPTURE_LOG_TAG, "CSI soft recover (HDMI still locked)");
-        tc358743_set_csi_uyvy422(c->tc, true);
-        (void)tc358743_reapply_csi_path_after_hdmi(c->tc);
-        (void)tc358743_set_streaming(c->tc, true);
+        ESP_LOGW(CAPTURE_LOG_TAG, "CSI soft recover (stream re-assert only, no CTXRST)");
         capture_configure_p4_csi_bridge(c->hres, c->vres);
         ISP.cntl.isp_en = 0;
-
-        if (s_cam_started) {
-            (void)esp_cam_ctlr_stop(s_cam);
-            s_cam_started = false;
-            vTaskDelay(pdMS_TO_TICKS(20));
-        }
-        c->ping_fb_idx = 0;
-        c->done_fb = NULL;
-        /* keep dma_done counter — useful for debugging */
-        c->csi_get_new_irqs = 0;
-        while (c->csi_done_sem && xSemaphoreTake(c->csi_done_sem, 0) == pdTRUE) {
-        }
-
-        esp_err_t er = esp_cam_ctlr_start(s_cam);
-        if (er == ESP_OK) {
-            s_cam_started = true;
-            (void)tc358743_reapply_csi_path_after_hdmi(c->tc);
-            (void)tc358743_set_streaming(c->tc, true);
-        }
-        return er;
+        (void)tc358743_set_streaming(c->tc, true);
+        return ESP_OK;
     }
 
     /* Unlocked: full HPD cycle to wake the source. */
@@ -436,7 +423,6 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     esp_err_t er = esp_cam_ctlr_start(s_cam);
     if (er == ESP_OK) {
         s_cam_started = true;
-        (void)tc358743_reapply_csi_path_after_hdmi(c->tc);
         (void)tc358743_set_streaming(c->tc, true);
     }
     return er;
