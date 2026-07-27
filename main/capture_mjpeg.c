@@ -27,7 +27,8 @@ void capture_mjpeg_run(capture_ctx_t *c)
     jpeg_encode_engine_cfg_t jcfg = {.intr_priority = 0, .timeout_ms = 500};
     ESP_ERROR_CHECK(jpeg_new_encoder_engine(&jcfg, &s_jpeg_enc));
 
-    const size_t jpeg_cap = (size_t)c->hres * (size_t)c->vres + 384u * 1024u;
+    /* Size JPEG slots for max resolution so dynamic res works. */
+    const size_t jpeg_cap = (size_t)CAPTURE_MAX_H * (size_t)CAPTURE_MAX_V + 384u * 1024u;
     jpeg_encode_memory_alloc_cfg_t jmem = {.buffer_direction = JPEG_ENC_ALLOC_OUTPUT_BUFFER};
     size_t smallest_alloc = SIZE_MAX;
     for (int i = 0; i < JPEG_SLOT_COUNT; i++) {
@@ -69,7 +70,7 @@ void capture_mjpeg_run(capture_ctx_t *c)
             int64_t now = (int64_t)esp_timer_get_time();
             if (now >= hdmi_recover_cooldown_until_us) {
                 (void)capture_hw_hdmi_recover(c);
-                hdmi_recover_cooldown_until_us = now + (int64_t)20 * 1000000;
+                hdmi_recover_cooldown_until_us = now + (int64_t)3 * 1000000;
             }
             continue;
         }
@@ -89,7 +90,6 @@ void capture_mjpeg_run(capture_ctx_t *c)
         } else if (q > 100u) {
             q = 100u;
         }
-        /* RGB888 from CSI (p4kvm path). */
         jpeg_encode_cfg_t enc = {.width = c->hres,
                                  .height = c->vres,
                                  .src_type = JPEG_ENCODE_IN_FORMAT_RGB888,
