@@ -22,7 +22,7 @@
         border-bottom: 1px solid #ffffff1f;
       }
       h1 { margin: 0; font-size: 1.25rem; font-weight: 600; color: #c8d4ee; }
-      .right { display: flex; align-items: center; gap: 0.75rem; }
+      .right { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
       #st { margin: 0; font-size: 0.9rem; color: #c8d4ee; }
       #fps { font-variant-numeric: tabular-nums; color: #8bd88b; font-size: 0.9rem; }
       #fps.hidden { display: none; }
@@ -54,6 +54,7 @@
       .panel label { display: flex; flex-direction: column; gap: 0.35rem; font-size: 0.85rem; color: #b8c4dc; }
       .panel .row { display: flex; gap: 0.5rem; align-items: center; }
       input[type="number"] { width: 3.5rem; font: inherit; padding: 0.25rem 0.35rem; }
+      input[type="range"] { width: 100%; }
       button {
         font: inherit;
         cursor: pointer;
@@ -88,35 +89,45 @@
             <label>
               Encoding quality (1–100)
               <span class="row">
-                <input type="number" id="jpeg-q" min="1" max="100" step="1" value="70" />
+                <input type="number" id="jpeg-q" min="1" max="100" step="1" value="55" />
                 <button type="button" id="btn-jpeg-q">Apply</button>
               </span>
             </label>
+            <label>
+              Volume
+              <input type="range" id="vol" min="0" max="100" value="80" />
+            </label>
             <label class="row">
-              <input type="checkbox" id="show-fps" />
+              <input type="checkbox" id="show-fps" checked />
               Show FPS
+            </label>
+            <label class="row">
+              <input type="checkbox" id="enable-audio" />
+              Enable audio
             </label>
           </div>
         </details>
       </div>
     </header>
     <div class="wrap">
-      <canvas id="view" width="1920" height="1080"></canvas>
+      <canvas id="view" width="720" height="480"></canvas>
     </div>
-    <p class="note">Video-only stream. No keyboard or mouse control (by design).</p>
+    <p class="note">MJPEG stream · refresh is safe · quality/volume in ⚙</p>
     <script>
       (function () {
-        const W = 1920, H = 1080;
         const canvas = document.getElementById("view");
-        const ctx = canvas.getContext("2d");
+        const ctx = canvas.getContext("2d", { alpha: false });
         const st = document.getElementById("st");
         const fpsEl = document.getElementById("fps");
         const jpegQ = document.getElementById("jpeg-q");
         const btnQ = document.getElementById("btn-jpeg-q");
         const showFps = document.getElementById("show-fps");
+        const volEl = document.getElementById("vol");
+        const enableAudio = document.getElementById("enable-audio");
 
         let frameCount = 0, lastT = performance.now();
         let abortCtrl = null;
+        let audioCtx = null, gainNode = null, audioAbort = null;
 
         function findBytes(hay, needle) {
           for (let i = 0; i <= hay.length - needle.length; i++) {
@@ -130,25 +141,38 @@
         const BOUNDARY = new TextEncoder().encode("--frame\r\n");
         const HEADER_END = new TextEncoder().encode("\r\n\r\n");
 
+        function stopStream() {
+          if (abortCtrl) {
+            try { abortCtrl.abort(); } catch (_) {}
+            abortCtrl = null;
+          }
+        }
+
         async function stream() {
-          if (abortCtrl) abortCtrl.abort();
+          stopStream();
           abortCtrl = new AbortController();
+          const signal = abortCtrl.signal;
           for (;;) {
+            if (signal.aborted) return;
             try {
               st.textContent = "Streaming";
-              const res = await fetch("/stream", { signal: abortCtrl.signal });
+              const res = await fetch("/stream", { signal, cache: "no-store" });
+              if (!res.ok || !res.body) throw new Error("stream " + res.status);
               const reader = res.body.getReader();
               let buf = new Uint8Array(0);
               for (;;) {
                 const { done, value } = await reader.read();
-                if (done) break;
+                if (done || signal.aborted) break;
                 if (value && value.length) {
                   const t = new Uint8Array(buf.length + value.length);
                   t.set(buf); t.set(value, buf.length); buf = t;
                 }
                 while (buf.length > 0) {
                   const bIdx = findBytes(buf, BOUNDARY);
-                  if (bIdx < 0) break;
+                  if (bIdx < 0) {
+                    if (buf.length > 65536) buf = buf.slice(buf.length - 4096);
+                    break;
+                  }
                   const after = buf.slice(bIdx + BOUNDARY.length);
                   const hEnd = findBytes(after, HEADER_END);
                   if (hEnd < 0) break;
@@ -162,7 +186,11 @@
                   const jpeg = buf.slice(start, start + jpegLen);
                   try {
                     const bmp = await createImageBitmap(new Blob([jpeg], { type: "image/jpeg" }));
-                    ctx.drawImage(bmp, 0, 0, W, H);
+                    if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
+                      canvas.width = bmp.width;
+                      canvas.height = bmp.height;
+                    }
+                    ctx.drawImage(bmp, 0, 0);
                     bmp.close();
                     frameCount++;
                     if (performance.now() - lastT >= 1000) {
@@ -178,10 +206,10 @@
                 }
               }
             } catch (e) {
-              if (abortCtrl.signal.aborted) return;
+              if (signal.aborted) return;
               st.textContent = "Reconnecting…";
             }
-            await new Promise((r) => setTimeout(r, 1000));
+            await new Promise((r) => setTimeout(r, 400));
           }
         }
 
@@ -208,12 +236,84 @@
           } catch (_) {}
         }
 
+        function stopAudio() {
+          if (audioAbort) {
+            try { audioAbort.abort(); } catch (_) {}
+            audioAbort = null;
+          }
+          if (audioCtx) {
+            try { audioCtx.close(); } catch (_) {}
+            audioCtx = null;
+            gainNode = null;
+          }
+        }
+
+        async function startAudio() {
+          stopAudio();
+          audioAbort = new AbortController();
+          try {
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+            gainNode = audioCtx.createGain();
+            gainNode.gain.value = (parseInt(volEl.value, 10) || 80) / 100;
+            gainNode.connect(audioCtx.destination);
+            const res = await fetch("/audio", { signal: audioAbort.signal, cache: "no-store" });
+            if (!res.ok || !res.body) {
+              st.textContent = "Audio unavailable";
+              stopAudio();
+              return;
+            }
+            const reader = res.body.getReader();
+            let leftover = new Uint8Array(0);
+            for (;;) {
+              const { done, value } = await reader.read();
+              if (done || audioAbort.signal.aborted) break;
+              if (!value || !value.length) continue;
+              const t = new Uint8Array(leftover.length + value.length);
+              t.set(leftover); t.set(value, leftover.length);
+              const frames = Math.floor(t.length / 4);
+              leftover = t.slice(frames * 4);
+              if (frames === 0) continue;
+              const f32 = new Float32Array(frames * 2);
+              const dv = new DataView(t.buffer, t.byteOffset, frames * 4);
+              for (let i = 0; i < frames; i++) {
+                f32[i * 2] = dv.getInt16(i * 4, true) / 32768;
+                f32[i * 2 + 1] = dv.getInt16(i * 4 + 2, true) / 32768;
+              }
+              const buf = audioCtx.createBuffer(2, frames, 48000);
+              const L = buf.getChannelData(0), R = buf.getChannelData(1);
+              for (let i = 0; i < frames; i++) {
+                L[i] = f32[i * 2];
+                R[i] = f32[i * 2 + 1];
+              }
+              const src = audioCtx.createBufferSource();
+              src.buffer = buf;
+              src.connect(gainNode);
+              src.start();
+            }
+          } catch (e) {
+            if (!audioAbort || !audioAbort.signal.aborted) {
+              /* ignore */
+            }
+          }
+        }
+
         btnQ.addEventListener("click", applyQ);
         jpegQ.addEventListener("keydown", (e) => { if (e.key === "Enter") applyQ(); });
         showFps.addEventListener("change", () => {
           fpsEl.classList.toggle("hidden", !showFps.checked);
         });
+        volEl.addEventListener("input", () => {
+          if (gainNode) gainNode.gain.value = (parseInt(volEl.value, 10) || 0) / 100;
+        });
+        enableAudio.addEventListener("change", () => {
+          if (enableAudio.checked) startAudio();
+          else stopAudio();
+        });
 
+        window.addEventListener("pagehide", () => { stopStream(); stopAudio(); });
+        window.addEventListener("beforeunload", () => { stopStream(); stopAudio(); });
+
+        fpsEl.classList.remove("hidden");
         syncQ();
         stream();
       })();
