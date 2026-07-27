@@ -82,6 +82,7 @@ static const char *TAG = "tc358743";
 #define MASK_D3M_HSTXVREGEN 0x0010
 
 #define TXOPTIONCNTRL 0x0238
+#define MASK_CONTCLKMODE 0x00000001
 
 #define CSI_START 0x0518
 #define MASK_STRT 0x00000001
@@ -359,6 +360,13 @@ static void sleep_mode(tc358743_t *d, bool enable)
     wr16_and_or(d, SYSCTL, (uint16_t)~MASK_SLEEP, enable ? MASK_SLEEP : 0);
 }
 
+/** Linux tc358743: non-cont first (LP11), then continuous to force LP11	o HS. */
+static void csi_force_lp11_to_hs(tc358743_t *d)
+{
+    wr32(d, TXOPTIONCNTRL, 0);
+    wr32(d, TXOPTIONCNTRL, MASK_CONTCLKMODE);
+}
+
 static void enable_stream(tc358743_t *d, bool enable)
 {
     if (enable) {
@@ -368,6 +376,10 @@ static void enable_stream(tc358743_t *d, bool enable)
     }
     wr16_and_or(d, CONFCTL, (uint16_t) ~(MASK_VBUFEN | MASK_ABUFEN),
                 enable ? (MASK_VBUFEN | MASK_ABUFEN) : 0);
+    if (enable) {
+        csi_force_lp11_to_hs(d);
+        wr32(d, CSI_START, MASK_STRT);
+    }
 }
 
 static void set_ref_clk(tc358743_t *d)
@@ -584,6 +596,8 @@ static void set_csi_lanes(tc358743_t *d, unsigned lanes)
     wr32(d, TXOPTIONCNTRL, 0);
     wr32(d, STARTCNTRL, MASK_START);
     wr32(d, CSI_START, MASK_STRT);
+    /* Kick continuous clock after PPI start (Linux stream-on path). */
+    wr32(d, TXOPTIONCNTRL, MASK_CONTCLKMODE);
 
     uint32_t nol = (lanes == 4) ? MASK_NOL_4 : (lanes == 3) ? MASK_NOL_3 : (lanes == 2) ? MASK_NOL_2 : MASK_NOL_1;
 
@@ -618,6 +632,7 @@ static void present_as_monitor(tc358743_t *d)
     ESP_LOGI(TAG, "HPD asserted — source should see a 1080p monitor and start TMDS");
     vTaskDelay(pdMS_TO_TICKS(200));
     wr32(d, CSI_START, MASK_STRT);
+    csi_force_lp11_to_hs(d);
 }
 
 esp_err_t tc358743_probe(i2c_master_bus_handle_t bus, const tc358743_cfg_t *cfg, tc358743_t **out_dev)
@@ -720,6 +735,7 @@ esp_err_t tc358743_reapply_csi_path_after_hdmi(tc358743_t *d)
     apply_csi_color_space(d);
     set_csi_lanes(d, d->cfg.lanes);
     wr32(d, CSI_START, MASK_STRT);
+    csi_force_lp11_to_hs(d);
     return ESP_OK;
 }
 
