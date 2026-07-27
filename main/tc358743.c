@@ -2,7 +2,8 @@
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * TC358743 path matched to jrowny/p4kvm (working): non-continuous MIPI clock.
+ * Continuous MIPI clock (CONTCLKMODE=1). Empirically required on this board:
+ * non-continuous left CSI TX idle; continuous delivered ~2000 frames.
  */
 #include "tc358743.h"
 
@@ -84,6 +85,7 @@ static const char *TAG = "tc358743";
 #define MASK_D3M_HSTXVREGEN 0x0010
 
 #define TXOPTIONCNTRL 0x0238
+#define MASK_CONTCLKMODE 0x00000001
 
 #define CSI_START 0x0518
 #define MASK_STRT 0x00000001
@@ -120,16 +122,10 @@ static const char *TAG = "tc358743";
 #define MASK_HPD_OUT0 0x01
 
 #define SYS_STATUS 0x8520
-#define VI_STATUS1 0x8522
-#define VI_STATUS2 0x8525
-#define CLK_STATUS 0x8526
-#define PHYERR_STATUS 0x8527
-#define VI_STATUS3 0x8528
 #define CSI_STATUS 0x0410
 #define CSI_CONTROL 0x040c
 #define CSI_INT 0x0414
 #define CSI_ERR 0x044c
-#define HDMI_DVI 0x8550
 #define PK_AVI_0HEAD 0x8710
 #define PK_AVI_16BYTE 0x8723
 #define PK_AVI_LEN ((PK_AVI_16BYTE) - (PK_AVI_0HEAD) + 1)
@@ -159,8 +155,6 @@ static const char *TAG = "tc358743";
 #define PHY_CSQ 0x853f
 #define MASK_CSQ_CNT 0x0f
 #define SET_CSQ_CNT_LEVEL(n) ((n) & MASK_CSQ_CNT)
-#define PHY_RST 0x8535
-#define MASK_RESET_CTRL 0x01
 #define HDMI_DET 0x8552
 #define MASK_HDMI_DET_V 0x30
 #define HV_RST 0x85af
@@ -198,7 +192,6 @@ static const char *TAG = "tc358743";
 #define MASK_VOUT_COLOR_SEL 0xe0
 #define MASK_VOUT_COLOR_RGB_FULL 0x00
 #define MASK_VOUT_COLOR_601_YCBCR_LIMITED 0x60
-#define MASK_VOUT_COLOR_709_YCBCR_LIMITED 0xa0
 
 #define INTSTATUS 0x0014
 #define INTMASK 0x0016
@@ -361,7 +354,14 @@ static void sleep_mode(tc358743_t *d, bool enable)
     wr16_and_or(d, SYSCTL, (uint16_t)~MASK_SLEEP, enable ? MASK_SLEEP : 0);
 }
 
-/* p4kvm / Linux: non-continuous clock only. No CONTCLK force. */
+/** Kick continuous clock: LP11 (0) then CONTCLK (1). */
+static void csi_force_contclk(tc358743_t *d)
+{
+    wr32(d, TXOPTIONCNTRL, 0);
+    wr32(d, CSI_START, MASK_STRT);
+    wr32(d, TXOPTIONCNTRL, MASK_CONTCLKMODE);
+}
+
 static void enable_stream(tc358743_t *d, bool enable)
 {
     if (enable) {
@@ -371,6 +371,9 @@ static void enable_stream(tc358743_t *d, bool enable)
     }
     wr16_and_or(d, CONFCTL, (uint16_t) ~(MASK_VBUFEN | MASK_ABUFEN),
                 enable ? (MASK_VBUFEN | MASK_ABUFEN) : 0);
+    if (enable) {
+        csi_force_contclk(d);
+    }
 }
 
 static void set_ref_clk(tc358743_t *d)
@@ -565,10 +568,10 @@ static void set_csi_lanes(tc358743_t *d, unsigned lanes)
          ((lanes > 0) ? MASK_CLM_HSTXVREGEN : 0) | ((lanes > 0) ? MASK_D0M_HSTXVREGEN : 0) |
              ((lanes > 1) ? MASK_D1M_HSTXVREGEN : 0) | ((lanes > 2) ? MASK_D2M_HSTXVREGEN : 0) |
              ((lanes > 3) ? MASK_D3M_HSTXVREGEN : 0));
-    /* Linux / p4kvm: non-continuous clock. */
     wr32(d, TXOPTIONCNTRL, 0);
     wr32(d, STARTCNTRL, MASK_START);
     wr32(d, CSI_START, MASK_STRT);
+    wr32(d, TXOPTIONCNTRL, MASK_CONTCLKMODE);
     uint32_t nol = (lanes == 4) ? MASK_NOL_4 : (lanes == 3) ? MASK_NOL_3 : (lanes == 2) ? MASK_NOL_2 : MASK_NOL_1;
     wr32(d, CSI_CONFW, MASK_MODE_SET | MASK_ADDRESS_CSI_CONTROL | MASK_CSI_MODE | MASK_TXHSMD | nol);
     wr32(d, CSI_CONFW, MASK_MODE_SET | MASK_ADDRESS_CSI_ERR_INTENA | MASK_TXBRK | MASK_QUNK | MASK_WCER | MASK_INER);
@@ -665,13 +668,12 @@ esp_err_t tc358743_init_streaming(tc358743_t *d)
 esp_err_t tc358743_enable_hdmi_output(tc358743_t *d)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
-    /* p4kvm order: VBUFEN on → delay → HPD → CSI_START */
     enable_stream(d, true);
     vTaskDelay(pdMS_TO_TICKS(150));
     hpd_set(d, true);
     vTaskDelay(pdMS_TO_TICKS(50));
-    wr32(d, CSI_START, MASK_STRT);
-    ESP_LOGI(TAG, "HPD asserted, CSI_START, non-cont clock");
+    csi_force_contclk(d);
+    ESP_LOGI(TAG, "HPD asserted, continuous MIPI clock");
     tc358743_debug_status(d);
     return ESP_OK;
 }
@@ -691,8 +693,8 @@ esp_err_t tc358743_reapply_csi_path_after_hdmi(tc358743_t *d)
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
     apply_csi_color_space(d);
     set_csi_lanes(d, d->cfg.lanes);
-    wr32(d, CSI_START, MASK_STRT);
     enable_stream(d, true);
+    csi_force_contclk(d);
     return ESP_OK;
 }
 
@@ -721,7 +723,7 @@ esp_err_t tc358743_set_streaming(tc358743_t *d, bool on)
     if (!on) {
         set_csi_lanes(d, d->cfg.lanes);
     } else {
-        wr32(d, CSI_START, MASK_STRT);
+        csi_force_contclk(d);
     }
     return ESP_OK;
 }
