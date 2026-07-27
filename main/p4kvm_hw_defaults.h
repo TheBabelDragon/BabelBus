@@ -6,6 +6,8 @@
 
 #define P4KVM_MIPI_LDO_CHAN_ID 3
 #define P4KVM_MIPI_LDO_VOLTAGE_MV 2500
+
+/* Waveshare ESP32-P4 CSI camera SCCB/I2C (same as DFRobot / Espressif examples). */
 #define P4KVM_TC358743_I2C_SDA_GPIO 7
 #define P4KVM_TC358743_I2C_SCL_GPIO 8
 
@@ -14,5 +16,5 @@
 #define P4KVM_CSI_H_RES 1920u
 #define P4KVM_CSI_V_RES 1080u
 
-/* 1080p60 UYVY on 2 lanes needs ~1.2 Gbps/lane headroom (was 972 for 1080p30). */
+/* 1080p UYVY on 2 lanes. */
 #define P4KVM_MIPI_LANE_MBPS 1200
