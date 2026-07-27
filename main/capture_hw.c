@@ -2,7 +2,15 @@
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * Waveshare ESP32-P4-WIFI6-DEV-KIT Rev 1.1 — CSI I2C GPIO7/8
+ * Waveshare ESP32-P4-WIFI6-DEV-KIT Rev 1.1 + Waveshare HDMI to CSI Adapter
+ *
+ * Confirmed wiring:
+ *   CSI FPC  → MIPI-CSI (I2C SDA=GPIO7 SCL=GPIO8 + data + 3V3)
+ *   RESET    → GPIO 23
+ *   I2S SCK  → GPIO 20
+ *   I2S WFS  → GPIO 21
+ *   I2S SD   → GPIO 22
+ *   GND      → GND
  */
 #include "capture_priv.h"
 
@@ -44,6 +52,11 @@ static bool s_cam_started;
 static const uint32_t s_csi_expected_dt = 0x1Eu;
 static capture_ctx_t s_cap;
 
+/**
+ * RESET is wired to GPIO 23 on this setup.
+ * Hold low long enough for a clean POR, then release and wait for the chip
+ * to come out of reset before any I2C traffic.
+ */
 static void tc358743_resetn_pulse(void)
 {
 #if CONFIG_P4KVM_TC358743_RST_GPIO >= 0
@@ -57,54 +70,46 @@ static void tc358743_resetn_pulse(void)
     };
     ESP_ERROR_CHECK(gpio_config(&io));
     gpio_set_level(rst, 0);
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(100));   /* assert RESET longer */
     gpio_set_level(rst, 1);
-    vTaskDelay(pdMS_TO_TICKS(250));
-    ESP_LOGI(CAPTURE_LOG_TAG, "TC358743 RESETN GPIO %d", rst);
+    vTaskDelay(pdMS_TO_TICKS(400));   /* recovery before first I2C */
+    ESP_LOGI(CAPTURE_LOG_TAG, "TC358743 RESETN released on GPIO %d", rst);
 #else
+    ESP_LOGW(CAPTURE_LOG_TAG, "No RESET GPIO configured — waiting 500 ms for POR");
     vTaskDelay(pdMS_TO_TICKS(500));
 #endif
 }
 
-/** Scan 7-bit addresses; log every ACK (expect 0x0F TC358743, often 0x18 ES8311). */
+/**
+ * Probe 0x0F explicitly. Returns true only if the TC358743 ACKs.
+ * Logs the real esp_err so we stop guessing.
+ */
+static bool tc358743_present(i2c_master_bus_handle_t bus)
+{
+    esp_err_t er = i2c_master_probe(bus, TC358743_I2C_ADDR, 200);
+    if (er == ESP_OK) {
+        ESP_LOGI(CAPTURE_LOG_TAG, "TC358743 ACK at 0x%02x", (unsigned)TC358743_I2C_ADDR);
+        return true;
+    }
+    ESP_LOGE(CAPTURE_LOG_TAG, "TC358743 probe 0x%02x failed: %s", (unsigned)TC358743_I2C_ADDR,
+             esp_err_to_name(er));
+    return false;
+}
+
+/** Full bus scan for diagnostics only. */
 static void i2c_bus_scan(i2c_master_bus_handle_t bus)
 {
     ESP_LOGI(CAPTURE_LOG_TAG, "I2C scan...");
     int found = 0;
-    bool saw_tc = false;
-    bool saw_codec = false;
     for (uint16_t addr = 1; addr < 0x7f; addr++) {
-        esp_err_t er = i2c_master_probe(bus, addr, 50);
-        if (er == ESP_OK) {
+        if (i2c_master_probe(bus, addr, 50) == ESP_OK) {
             ESP_LOGI(CAPTURE_LOG_TAG, "  ACK at 0x%02x", (unsigned)addr);
             found++;
-            if (addr == TC358743_I2C_ADDR) {
-                saw_tc = true;
-            }
-            if (addr == 0x18) {
-                saw_codec = true;
-            }
         }
     }
-    if (found == 0) {
-        ESP_LOGE(CAPTURE_LOG_TAG, "I2C scan: no devices — SDA/SCL path dead (GPIO7/8, pull-ups, FPC)");
-    } else {
-        ESP_LOGI(CAPTURE_LOG_TAG, "I2C scan: %d device(s)", found);
-    }
-    if (!saw_tc) {
-        ESP_LOGE(CAPTURE_LOG_TAG,
-                 "TC358743 (0x0F) NOT on bus! Onboard ES8311 %s. "
-                 "Reseat the CSI FPC, check RESETN (GPIO23), power to the HDMI adapter, "
-                 "and that the ribbon is the large MIPI-CSI connector (Pi-camera style).",
-                 saw_codec ? "is present (board I2C OK)" : "also missing");
-    }
+    ESP_LOGI(CAPTURE_LOG_TAG, "I2C scan: %d device(s)", found);
 }
 
-/**
- * Real lock needs TMDS+SYNC, and SYS_STATUS must not be a mono-fill byte
- * (0xDF/0x7F/...) which is what we get when register reads are junk.
- * CHIPID is only used here to reject false lock — init is never aborted on it.
- */
 static bool tc_locked(tc358743_t *tc)
 {
     uint8_t st = 0;
@@ -114,11 +119,11 @@ static bool tc_locked(tc358743_t *tc)
     }
     (void)tc358743_read_chip_id(tc, &id);
 
-    /* Mono-fill status (hi==lo in CHIPID, st matches) = not real HDMI lock */
+    /* Reject mono-fill (open bus / no device) */
     if ((id & 0xffu) == ((id >> 8) & 0xffu) && (id & 0xffu) != 0) {
         return false;
     }
-    if (st == 0xdfu || st == 0x7fu || st == 0x9fu || st == 0xf7u || st == 0xfdu) {
+    if (st == 0xffu || st == 0xdfu || st == 0x7fu || st == 0x9fu || st == 0xf7u || st == 0xfdu) {
         return false;
     }
 
@@ -142,7 +147,7 @@ static void wait_hdmi_lock(tc358743_t *tc, uint32_t timeout_ms)
             tc358743_debug_status(tc);
         }
     }
-    ESP_LOGW(CAPTURE_LOG_TAG, "HDMI lock timeout (SYS fill cannot count as lock)");
+    ESP_LOGW(CAPTURE_LOG_TAG, "HDMI lock timeout");
     tc358743_debug_status(tc);
     tc358743_log_link_state(tc);
 }
@@ -217,8 +222,10 @@ capture_ctx_t *capture_hw_init_start(void)
     };
     ESP_ERROR_CHECK(esp_ldo_acquire_channel(&ldo_cfg, &ldo));
 
+    /* 1. RESET first, with enough recovery time before any I2C. */
     tc358743_resetn_pulse();
 
+    /* 2. Create I2C bus only after the chip has left reset. */
     i2c_master_bus_handle_t i2c_bus = NULL;
     i2c_master_bus_config_t i2c_bus_cfg = {
         .i2c_port = I2C_NUM_0,
@@ -228,29 +235,36 @@ capture_ctx_t *capture_hw_init_start(void)
         .glitch_ignore_cnt = 7,
         .intr_priority = 0,
         .trans_queue_depth = 0,
-        /* Critical: CSI FPC / TC358743 path often has no strong external pull-ups.
-         * Without these the remote chip never ACKs while onboard 0x18 still does,
-         * producing the classic mono-fill 0xDF SYS_STATUS / CHIPID spam. */
         .flags = {.enable_internal_pullup = true},
     };
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus));
+
+    /* 3. Explicit presence check — abort if the bridge is not there. */
     i2c_bus_scan(i2c_bus);
+    if (!tc358743_present(i2c_bus)) {
+        ESP_LOGE(CAPTURE_LOG_TAG,
+                 "FATAL: TC358743 not responding at 0x0F after RESET. "
+                 "CSI will not be started. Check CSI FPC seating and contact side.");
+        /* Do not proceed — starting CSI with no bridge just produces the spam loop. */
+        vTaskDelete(NULL);
+        return NULL;
+    }
 
     ESP_ERROR_CHECK(tc358743_probe(i2c_bus, NULL, &s_cap.tc));
     ESP_ERROR_CHECK(tc358743_init_streaming(s_cap.tc));
     tc358743_set_csi_uyvy422(s_cap.tc, true);
     tc358743_log_link_state(s_cap.tc);
 
-    /* Early hard fail if I2C is still garbage — no point starting CSI. */
+    /* Sanity: CHIPID must not be mono-fill now that probe succeeded. */
     {
         uint16_t id = 0;
         (void)tc358743_read_chip_id(s_cap.tc, &id);
         if ((id & 0xffu) == ((id >> 8) & 0xffu) && (id & 0xffu) != 0) {
-            ESP_LOGE(CAPTURE_LOG_TAG,
-                     "TC358743 CHIPID still mono-fill 0x%04x after init — I2C not talking to the bridge. "
-                     "Fix FPC / RESETN / power before CSI will ever produce frames.",
-                     id);
+            ESP_LOGE(CAPTURE_LOG_TAG, "CHIPID mono-fill 0x%04x after successful probe — aborting", id);
+            vTaskDelete(NULL);
+            return NULL;
         }
+        ESP_LOGI(CAPTURE_LOG_TAG, "TC358743 CHIPID=0x%04x (ok)", id);
     }
 
     ESP_ERROR_CHECK(tc358743_enable_hdmi_output(s_cap.tc));
