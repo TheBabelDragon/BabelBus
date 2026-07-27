@@ -337,15 +337,6 @@ static uint16_t rd16(tc358743_t *d, uint16_t r)
     return (uint16_t)b[0] | ((uint16_t)b[1] << 8);
 }
 
-#if CONFIG_P4KVM_TC358743_ADV_DEBUG
-static uint32_t rd32(tc358743_t *d, uint16_t r)
-{
-    uint8_t b[4] = {0};
-    i2c_read_reg(d, r, b, 4);
-    return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
-}
-#endif
-
 static void wr16_and_or(tc358743_t *d, uint16_t r, uint16_t mask, uint16_t val)
 {
     wr16(d, r, (rd16(d, r) & mask) | val);
@@ -752,20 +743,12 @@ esp_err_t tc358743_get_avi_color_format(tc358743_t *d, uint8_t *out_y)
 
 void tc358743_debug_stall_extras(tc358743_t *d)
 {
-#if !CONFIG_P4KVM_TC358743_ADV_DEBUG
     (void)d;
-#else
-    (void)d;
-#endif
 }
 
 void tc358743_debug_bridge(tc358743_t *d)
 {
-#if !CONFIG_P4KVM_TC358743_ADV_DEBUG
     (void)d;
-#else
-    (void)d;
-#endif
 }
 
 esp_err_t tc358743_set_streaming(tc358743_t *d, bool on)
