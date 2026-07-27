@@ -11,6 +11,9 @@
  *   I2S WFS  → GPIO 21
  *   I2S SD   → GPIO 22
  *   GND      → GND
+ *
+ * I2C: board has external pull-ups — do NOT enable internal ones
+ * (Waveshare wiki / example: enable_internal_pullup = false).
  */
 #include "capture_priv.h"
 
@@ -52,11 +55,6 @@ static bool s_cam_started;
 static const uint32_t s_csi_expected_dt = 0x1Eu;
 static capture_ctx_t s_cap;
 
-/**
- * RESET is wired to GPIO 23 on this setup.
- * Hold low long enough for a clean POR, then release and wait for the chip
- * to come out of reset before any I2C traffic.
- */
 static void tc358743_resetn_pulse(void)
 {
 #if CONFIG_P4KVM_TC358743_RST_GPIO >= 0
@@ -70,9 +68,9 @@ static void tc358743_resetn_pulse(void)
     };
     ESP_ERROR_CHECK(gpio_config(&io));
     gpio_set_level(rst, 0);
-    vTaskDelay(pdMS_TO_TICKS(100));   /* assert RESET longer */
+    vTaskDelay(pdMS_TO_TICKS(100));
     gpio_set_level(rst, 1);
-    vTaskDelay(pdMS_TO_TICKS(400));   /* recovery before first I2C */
+    vTaskDelay(pdMS_TO_TICKS(400));
     ESP_LOGI(CAPTURE_LOG_TAG, "TC358743 RESETN released on GPIO %d", rst);
 #else
     ESP_LOGW(CAPTURE_LOG_TAG, "No RESET GPIO configured — waiting 500 ms for POR");
@@ -80,10 +78,6 @@ static void tc358743_resetn_pulse(void)
 #endif
 }
 
-/**
- * Probe 0x0F explicitly. Returns true only if the TC358743 ACKs.
- * Logs the real esp_err so we stop guessing.
- */
 static bool tc358743_present(i2c_master_bus_handle_t bus)
 {
     esp_err_t er = i2c_master_probe(bus, TC358743_I2C_ADDR, 200);
@@ -96,7 +90,6 @@ static bool tc358743_present(i2c_master_bus_handle_t bus)
     return false;
 }
 
-/** Full bus scan for diagnostics only. */
 static void i2c_bus_scan(i2c_master_bus_handle_t bus)
 {
     ESP_LOGI(CAPTURE_LOG_TAG, "I2C scan...");
@@ -119,7 +112,6 @@ static bool tc_locked(tc358743_t *tc)
     }
     (void)tc358743_read_chip_id(tc, &id);
 
-    /* Reject mono-fill (open bus / no device) */
     if ((id & 0xffu) == ((id >> 8) & 0xffu) && (id & 0xffu) != 0) {
         return false;
     }
@@ -222,10 +214,8 @@ capture_ctx_t *capture_hw_init_start(void)
     };
     ESP_ERROR_CHECK(esp_ldo_acquire_channel(&ldo_cfg, &ldo));
 
-    /* 1. RESET first, with enough recovery time before any I2C. */
     tc358743_resetn_pulse();
 
-    /* 2. Create I2C bus only after the chip has left reset. */
     i2c_master_bus_handle_t i2c_bus = NULL;
     i2c_master_bus_config_t i2c_bus_cfg = {
         .i2c_port = I2C_NUM_0,
@@ -235,17 +225,17 @@ capture_ctx_t *capture_hw_init_start(void)
         .glitch_ignore_cnt = 7,
         .intr_priority = 0,
         .trans_queue_depth = 0,
-        .flags = {.enable_internal_pullup = true},
+        /* Waveshare ESP32-P4-WIFI6-DEV-KIT already has external I2C pull-ups.
+         * Official wiki/example: enable_internal_pullup = false. */
+        .flags = {.enable_internal_pullup = false},
     };
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus));
 
-    /* 3. Explicit presence check — abort if the bridge is not there. */
     i2c_bus_scan(i2c_bus);
     if (!tc358743_present(i2c_bus)) {
         ESP_LOGE(CAPTURE_LOG_TAG,
                  "FATAL: TC358743 not responding at 0x0F after RESET. "
-                 "CSI will not be started. Check CSI FPC seating and contact side.");
-        /* Do not proceed — starting CSI with no bridge just produces the spam loop. */
+                 "CSI will not be started.");
         vTaskDelete(NULL);
         return NULL;
     }
@@ -255,7 +245,6 @@ capture_ctx_t *capture_hw_init_start(void)
     tc358743_set_csi_uyvy422(s_cap.tc, true);
     tc358743_log_link_state(s_cap.tc);
 
-    /* Sanity: CHIPID must not be mono-fill now that probe succeeded. */
     {
         uint16_t id = 0;
         (void)tc358743_read_chip_id(s_cap.tc, &id);
