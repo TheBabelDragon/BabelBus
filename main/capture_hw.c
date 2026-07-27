@@ -52,7 +52,6 @@
 static esp_cam_ctlr_handle_t s_cam;
 static isp_proc_handle_t s_isp_bypass;
 static bool s_cam_started;
-static const uint32_t s_csi_expected_dt = 0x1Eu;
 static capture_ctx_t s_cap;
 
 static void tc358743_resetn_pulse(void)
@@ -211,8 +210,9 @@ static void capture_configure_p4_csi_bridge(uint32_t hres, uint32_t vres)
     MIPI_CSI_BRIDGE.frame_cfg.vadr_num = vres;
     MIPI_CSI_BRIDGE.frame_cfg.has_hsync_e = 0u;
     MIPI_CSI_BRIDGE.frame_cfg.vadr_num_check = 0u;
-    MIPI_CSI_BRIDGE.data_type_cfg.data_type_min = s_csi_expected_dt;
-    MIPI_CSI_BRIDGE.data_type_cfg.data_type_max = s_csi_expected_dt;
+    /* Accept any CSI data type — wrong filter was a silent black-hole. */
+    MIPI_CSI_BRIDGE.data_type_cfg.data_type_min = 0x00u;
+    MIPI_CSI_BRIDGE.data_type_cfg.data_type_max = 0x3Fu;
     MIPI_CSI_BRIDGE.int_clr.val = 0x3fu;
 }
 
@@ -328,6 +328,9 @@ capture_ctx_t *capture_hw_init_start(void)
         return NULL;
     }
 
+    ESP_LOGI(CAPTURE_LOG_TAG, "MIPI lane rate %u Mbps (must match TC358743 PLL)",
+             (unsigned)P4KVM_MIPI_LANE_MBPS);
+
     esp_cam_ctlr_csi_config_t csi_cfg = {
         .ctlr_id = 0,
         .clk_src = MIPI_CSI_PHY_CLK_SRC_DEFAULT,
@@ -337,7 +340,6 @@ capture_ctx_t *capture_hw_init_start(void)
         .lane_bit_rate_mbps = P4KVM_MIPI_LANE_MBPS,
         .queue_items = CAPTURE_FB_COUNT,
         .byte_swap_en = false,
-        /* Keep driver backup buffer so a missed get_new cannot assert. */
         .bk_buffer_dis = false,
     };
     esp_isp_processor_cfg_t isp_cfg = {
@@ -373,10 +375,10 @@ capture_ctx_t *capture_hw_init_start(void)
 
     ESP_ERROR_CHECK(esp_cam_ctlr_start(s_cam));
     s_cam_started = true;
-    /* Final stream assert after RX is armed. */
     (void)tc358743_set_streaming(s_cap.tc, true);
-    ESP_LOGI(CAPTURE_LOG_TAG, "CSI started %ux%u UYVY fb=%zu", (unsigned)s_cap.hres,
-             (unsigned)s_cap.vres, s_cap.frame_bytes);
+    ESP_LOGI(CAPTURE_LOG_TAG, "CSI started %ux%u UYVY fb=%zu lane=%uMbps",
+             (unsigned)s_cap.hres, (unsigned)s_cap.vres, s_cap.frame_bytes,
+             (unsigned)P4KVM_MIPI_LANE_MBPS);
     return &s_cap;
 }
 
@@ -387,14 +389,6 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     const bool locked = tc_locked(c->tc);
 
     if (locked) {
-        /*
-         * HDMI OK and we already got frames (or almost). Do NOT:
-         *  - HPD cycle
-         *  - CTXRST / full CSI lane reprogram (reapply_csi_path)
-         *  - esp_cam stop/start
-         * Those all break continuous MIPI after the first dma_done.
-         * Only re-assert video mute off + VBUFEN + CSI_START.
-         */
         ESP_LOGW(CAPTURE_LOG_TAG, "CSI soft recover (stream re-assert only, no CTXRST)");
         capture_configure_p4_csi_bridge(c->hres, c->vres);
         ISP.cntl.isp_en = 0;
@@ -402,7 +396,6 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
         return ESP_OK;
     }
 
-    /* Unlocked: full HPD cycle to wake the source. */
     ESP_LOGW(CAPTURE_LOG_TAG, "CSI hard recover (HDMI unlocked — HPD cycle)");
     if (s_cam_started) {
         (void)esp_cam_ctlr_stop(s_cam);
