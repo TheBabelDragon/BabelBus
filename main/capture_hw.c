@@ -107,7 +107,7 @@ static bool tc_locked(tc358743_t *tc)
     if (st == 0xffu || st == 0xdfu || st == 0x7fu || st == 0x9fu || st == 0xf7u || st == 0xfdu) {
         return false;
     }
-    /* TMDS (bit1) + SCDT (bit3) + SYNC (bit7). Ignore DDC5V — often sticky. */
+    /* TMDS (bit1) + SCDT (bit3) + SYNC (bit7). DDC5V is accurate on this board but not required. */
     return ((st & 0x02) != 0) && ((st & 0x08) != 0) && ((st & 0x80) != 0);
 }
 
@@ -391,14 +391,11 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     const bool locked = tc_locked(c->tc);
 
     /*
-     * Soft path (HDMI still looks locked):
-     *   cam stop → drain → stream re-assert → cam start
-     * Do NOT call set_csi_lanes / CTXRST — that kills a working TX mid-run.
-     *
-     * Hard path (HDMI unlocked):
-     *   HPD cycle + full CSI reapply.
+     * Recover is only called when the stream is already dead (timeout).
+     * Full CSI reapply (CTXRST) is correct here — TX is idle.
+     * Unlocked: also HPD-cycle the source.
      */
-    ESP_LOGW(CAPTURE_LOG_TAG, "CSI recover (locked=%d): cam stop → requeue → start",
+    ESP_LOGW(CAPTURE_LOG_TAG, "CSI recover (locked=%d): cam stop → CSI reapply → start",
              (int)locked);
 
     if (s_cam_started) {
@@ -412,11 +409,11 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     if (!locked) {
         (void)tc358743_hdmi_hotplug_reset(c->tc);
         wait_hdmi_lock(c->tc, 5000);
-        if (tc_locked(c->tc)) {
-            after_hdmi_lock(c->tc);
-        }
+    }
+
+    if (tc_locked(c->tc)) {
+        after_hdmi_lock(c->tc);
     } else {
-        /* Keep CSI block warm — only re-open video FIFO + continuous clock. */
         (void)tc358743_set_streaming(c->tc, true);
     }
 
