@@ -144,6 +144,21 @@ static void wait_hdmi_lock(tc358743_t *tc, uint32_t timeout_ms)
     tc358743_log_link_state(tc);
 }
 
+/** After TMDS lock: reprogram CSI TX on the bridge and log measured timing. */
+static void after_hdmi_lock(tc358743_t *tc)
+{
+    uint16_t hact = 0, vact = 0;
+    if (tc358743_get_detected_timing(tc, &hact, &vact) == ESP_OK) {
+        ESP_LOGI(CAPTURE_LOG_TAG, "HDMI timing HAct=%u VAct=%u (CSI expects %ux%u)",
+                 (unsigned)hact, (unsigned)vact,
+                 (unsigned)P4KVM_CSI_H_RES, (unsigned)P4KVM_CSI_V_RES);
+    }
+    tc358743_set_csi_uyvy422(tc, true);
+    (void)tc358743_reapply_csi_path_after_hdmi(tc);
+    (void)tc358743_set_streaming(tc, true);
+    ESP_LOGI(CAPTURE_LOG_TAG, "CSI path reapplied after HDMI lock");
+}
+
 void capture_debug_csi_timeout(capture_ctx_t *c, unsigned bpp, size_t fb_bytes)
 {
     (void)bpp;
@@ -151,6 +166,10 @@ void capture_debug_csi_timeout(capture_ctx_t *c, unsigned bpp, size_t fb_bytes)
     if (c && c->tc) {
         tc358743_debug_status(c->tc);
         tc358743_log_link_state(c->tc);
+        uint16_t hact = 0, vact = 0;
+        if (tc358743_get_detected_timing(c->tc, &hact, &vact) == ESP_OK) {
+            ESP_LOGW(CAPTURE_LOG_TAG, "stall timing HAct=%u VAct=%u", (unsigned)hact, (unsigned)vact);
+        }
     }
 }
 
@@ -225,8 +244,6 @@ capture_ctx_t *capture_hw_init_start(void)
         .glitch_ignore_cnt = 7,
         .intr_priority = 0,
         .trans_queue_depth = 0,
-        /* Waveshare ESP32-P4-WIFI6-DEV-KIT already has external I2C pull-ups.
-         * Official wiki/example: enable_internal_pullup = false. */
         .flags = {.enable_internal_pullup = false},
     };
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus));
@@ -261,6 +278,10 @@ capture_ctx_t *capture_hw_init_start(void)
     if (!tc_locked(s_cap.tc)) {
         (void)tc358743_hdmi_hotplug_reset(s_cap.tc);
         wait_hdmi_lock(s_cap.tc, 5000);
+    }
+
+    if (tc_locked(s_cap.tc)) {
+        after_hdmi_lock(s_cap.tc);
     }
 
     s_cap.hres = P4KVM_CSI_H_RES;
@@ -328,6 +349,9 @@ capture_ctx_t *capture_hw_init_start(void)
     capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
 
     tc358743_set_csi_uyvy422(s_cap.tc, true);
+    (void)tc358743_reapply_csi_path_after_hdmi(s_cap.tc);
+    (void)tc358743_set_streaming(s_cap.tc, true);
+
     ESP_ERROR_CHECK(esp_cam_ctlr_start(s_cam));
     s_cam_started = true;
     ESP_LOGI(CAPTURE_LOG_TAG, "CSI started");
@@ -343,7 +367,9 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     }
     (void)tc358743_hdmi_hotplug_reset(c->tc);
     wait_hdmi_lock(c->tc, 5000);
-    tc358743_set_csi_uyvy422(c->tc, true);
+    if (tc_locked(c->tc)) {
+        after_hdmi_lock(c->tc);
+    }
     capture_configure_p4_csi_bridge(c->hres, c->vres);
     ISP.cntl.isp_en = 0;
     c->ping_fb_idx = 0;
@@ -353,6 +379,8 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     esp_err_t er = esp_cam_ctlr_start(s_cam);
     if (er == ESP_OK) {
         s_cam_started = true;
+        (void)tc358743_reapply_csi_path_after_hdmi(c->tc);
+        (void)tc358743_set_streaming(c->tc, true);
     }
     return er;
 }
