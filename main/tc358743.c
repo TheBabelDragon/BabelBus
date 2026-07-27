@@ -2,7 +2,7 @@
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * Continuous MIPI clock. VI_MUTE forced clear on stream-on (solid 0x80 was blank).
+ * Colorbar mode proves CSI→JPEG path; solid 0x80 is source blank (often HDCP).
  */
 #include "tc358743.h"
 
@@ -32,6 +32,7 @@ static const char *TAG = "tc358743";
 #define CONFCTL 0x0004
 #define MASK_YCBCRFMT 0x00c0
 #define MASK_YCBCRFMT_422_8_BIT 0x00c0
+#define MASK_YCBCRFMT_COLORBAR 0x0080
 #define MASK_VBUFEN 0x0001
 #define MASK_ABUFEN 0x0002
 #define MASK_AUDCHNUM_2 0x0c00
@@ -121,6 +122,7 @@ static const char *TAG = "tc358743";
 #define MASK_HPD_OUT0 0x01
 
 #define SYS_STATUS 0x8520
+#define MASK_S_HDMI 0x02
 #define PK_AVI_0HEAD 0x8710
 #define PK_AVI_16BYTE 0x8723
 #define PK_AVI_LEN ((PK_AVI_16BYTE) - (PK_AVI_0HEAD) + 1)
@@ -206,14 +208,7 @@ static const char *TAG = "tc358743";
 
 #define FORCE_MUTE 0x8602
 #define AUTO_CMD0 0x8603
-#define MASK_AUTO_MUTE7 0x80
-#define MASK_AUTO_MUTE6 0x40
-#define MASK_AUTO_MUTE5 0x20
-#define MASK_AUTO_MUTE4 0x10
-#define MASK_AUTO_MUTE1 0x02
-#define MASK_AUTO_MUTE0 0x01
 #define AUTO_CMD1 0x8604
-#define MASK_AUTO_MUTE9 0x02
 #define AUTO_CMD2 0x8605
 #define MASK_AUTO_PLAY3 0x08
 #define MASK_AUTO_PLAY2 0x04
@@ -234,6 +229,11 @@ static const char *TAG = "tc358743";
 #define MASK_SDO_FMT_I2S 0x02
 #define DIV_MODE 0x8612
 #define SET_DIV_DLY_MS(ms) ((ms) & 0xff)
+
+/* Set 1 to force chip colorbar (stripes) — proves end-to-end if pixsum leaves 32768. */
+#ifndef BABELBUS_FORCE_COLORBAR
+#define BABELBUS_FORCE_COLORBAR 1
+#endif
 
 struct tc358743 {
     i2c_master_dev_handle_t i2c;
@@ -348,10 +348,23 @@ static void csi_force_contclk(tc358743_t *d)
     wr32(d, TXOPTIONCNTRL, MASK_CONTCLKMODE);
 }
 
+static void apply_hdmi_or_dvi(tc358743_t *d)
+{
+    uint8_t st = rd8(d, SYS_STATUS);
+    /* Our status decode: HDMI bit printed separately; SYS bit1 often tracks HDMI. */
+    bool hdmi = (st & MASK_S_HDMI) != 0;
+    if (hdmi) {
+        wr8_and_or(d, VI_MODE, (uint8_t)~MASK_RGB_DVI, 0);
+        ESP_LOGI(TAG, "VI_MODE HDMI (RGB_DVI=0)");
+    } else {
+        wr8_and_or(d, VI_MODE, (uint8_t)~MASK_RGB_DVI, MASK_RGB_DVI);
+        ESP_LOGI(TAG, "VI_MODE DVI (RGB_DVI=1)");
+    }
+}
+
 static void enable_stream(tc358743_t *d, bool enable)
 {
     if (enable) {
-        /* Force full unmute — AUTO_MUTE alone left solid 0x80 blank frames. */
         wr8(d, VI_MUTE, 0);
     } else {
         wr8(d, VI_MUTE, MASK_AUTO_MUTE | MASK_VI_MUTE);
@@ -493,7 +506,13 @@ static void set_csi_color_space_rgb888_regs(tc358743_t *d)
 {
     wr8_and_or(d, VOUT_SET2, (uint8_t) ~(MASK_SEL422 | MASK_VOUT_422FIL_100), 0);
     wr8_and_or(d, VI_REP, (uint8_t)~MASK_VOUT_COLOR_SEL, MASK_VOUT_COLOR_RGB_FULL);
+#if BABELBUS_FORCE_COLORBAR
+    /* YFmt=2 colorbar — stripes on stream; set BABELBUS_FORCE_COLORBAR 0 for live HDMI. */
+    wr16_and_or(d, CONFCTL, (uint16_t)~MASK_YCBCRFMT, MASK_YCBCRFMT_COLORBAR);
+    ESP_LOGW(TAG, "COLORBAR ON (CONFCTL YFmt=2) — expect stripes, not solid grey");
+#else
     wr16_and_or(d, CONFCTL, (uint16_t)~MASK_YCBCRFMT, 0);
+#endif
 }
 
 static void set_csi_color_space_uyvy422_regs(tc358743_t *d)
@@ -658,6 +677,7 @@ esp_err_t tc358743_enable_hdmi_output(tc358743_t *d)
     vTaskDelay(pdMS_TO_TICKS(150));
     hpd_set(d, true);
     vTaskDelay(pdMS_TO_TICKS(50));
+    apply_hdmi_or_dvi(d);
     csi_force_contclk(d);
     wr8(d, VI_MUTE, 0);
     ESP_LOGI(TAG, "HPD asserted, continuous clock, VI_MUTE=0");
@@ -678,6 +698,7 @@ esp_err_t tc358743_hdmi_hotplug_reset(tc358743_t *d)
 esp_err_t tc358743_reapply_csi_path_after_hdmi(tc358743_t *d)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
+    apply_hdmi_or_dvi(d);
     apply_csi_color_space(d);
     set_csi_lanes(d, d->cfg.lanes);
     enable_stream(d, true);
