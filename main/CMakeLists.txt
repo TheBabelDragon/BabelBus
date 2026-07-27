@@ -9,6 +9,7 @@ set(babelbus_srcs
     "wifi_net.c"
     "main.c"
     "tc358743.c"
+    "tc358743_bus.c"
 )
 
 idf_component_register(
