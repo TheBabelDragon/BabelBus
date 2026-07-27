@@ -36,7 +36,7 @@ static void stream_release_slot_ref(int slot)
 }
 
 #define STREAM_WORKER_STACK (12 * 1024)
-#define STREAM_WORKER_PRIO (tskIDLE_PRIORITY + 5)
+#define STREAM_WORKER_PRIO (tskIDLE_PRIORITY + 7)
 #define AUDIO_WORKER_STACK (8 * 1024)
 #define AUDIO_CHUNK 2048
 
@@ -47,10 +47,11 @@ static esp_err_t root_get(httpd_req_t *req)
 {
     const size_t len = (size_t)(index_html_end - index_html_start);
     httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_send(req, index_html_start, len);
 }
 
-/** GET /jpeg-quality optional query `q=1..100` sets quality; response body is current quality (text/plain). */
+/** GET /jpeg-quality optional query `q=1..100` sets quality; response body is current quality. */
 static esp_err_t jpeg_quality_get(httpd_req_t *req)
 {
     char query[96];
@@ -106,6 +107,10 @@ static void stream_worker_task(void *arg)
     uint32_t last_seq = g_jpeg_frame.frame_seq;
 
     while (1) {
+        if (stream_peer_disconnected(req)) {
+            break;
+        }
+
         bool stop = false;
         while (g_jpeg_frame.frame_seq == last_seq) {
             if (!g_jpeg_frame.frame_ready_sem) {
@@ -116,7 +121,7 @@ static void stream_worker_task(void *arg)
                 }
                 continue;
             }
-            if (xSemaphoreTake(g_jpeg_frame.frame_ready_sem, pdMS_TO_TICKS(500)) != pdTRUE) {
+            if (xSemaphoreTake(g_jpeg_frame.frame_ready_sem, pdMS_TO_TICKS(300)) != pdTRUE) {
                 if (stream_peer_disconnected(req)) {
                     stop = true;
                     break;
@@ -124,29 +129,23 @@ static void stream_worker_task(void *arg)
                 continue;
             }
             while (xSemaphoreTake(g_jpeg_frame.frame_ready_sem, 0) == pdTRUE) {
-                /* coalesce */
             }
         }
         if (stop) {
             break;
         }
 
-        if (xSemaphoreTake(g_jpeg_frame.xmit_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        if (xSemaphoreTake(g_jpeg_frame.xmit_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
             if (stream_peer_disconnected(req)) {
                 break;
             }
-            vTaskDelay(pdMS_TO_TICKS(5));
             continue;
         }
         size_t copy_len = 0;
         uint32_t seq_snap = last_seq;
         int slot = -1;
-        if (xSemaphoreTake(g_jpeg_frame.mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        if (xSemaphoreTake(g_jpeg_frame.mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
             xSemaphoreGive(g_jpeg_frame.xmit_mutex);
-            if (stream_peer_disconnected(req)) {
-                break;
-            }
-            vTaskDelay(pdMS_TO_TICKS(2));
             continue;
         }
         int f = g_jpeg_frame.front_idx;
@@ -159,17 +158,11 @@ static void stream_worker_task(void *arg)
             } else {
                 copy_len = 0;
             }
-        } else {
-            copy_len = 0;
         }
         xSemaphoreGive(g_jpeg_frame.mutex);
         if (copy_len == 0 || slot < 0) {
             xSemaphoreGive(g_jpeg_frame.xmit_mutex);
             last_seq = seq_snap;
-            if (stream_peer_disconnected(req)) {
-                break;
-            }
-            vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
@@ -183,12 +176,15 @@ static void stream_worker_task(void *arg)
             stream_release_slot_ref(slot);
             xSemaphoreGive(g_jpeg_frame.xmit_mutex);
             last_seq = seq_snap;
-            if (stream_peer_disconnected(req)) {
-                break;
-            }
-            vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
+
+        if (stream_peer_disconnected(req)) {
+            stream_release_slot_ref(slot);
+            xSemaphoreGive(g_jpeg_frame.xmit_mutex);
+            break;
+        }
+
         esp_err_t se = httpd_resp_send_chunk(req, hdr, hl);
         if (se == ESP_OK) {
             se = httpd_resp_send_chunk(req, (const char *)g_jpeg_frame.jpeg_buf[slot], copy_len);
@@ -200,16 +196,14 @@ static void stream_worker_task(void *arg)
         xSemaphoreGive(g_jpeg_frame.xmit_mutex);
 
         if (se != ESP_OK) {
-            ESP_LOGD(TAG, "stream end %s", esp_err_to_name(se));
+            /* Browser refresh → ECONNRESET; expected, not an error. */
             break;
         }
         last_seq = seq_snap;
     }
     jpeg_frame_stream_leave();
-    httpd_resp_sendstr_chunk(req, NULL);
-    if (httpd_req_async_handler_complete(req) != ESP_OK) {
-        ESP_LOGW(TAG, "stream async complete failed");
-    }
+    (void)httpd_resp_sendstr_chunk(req, NULL);
+    (void)httpd_req_async_handler_complete(req);
     vTaskDelete(NULL);
 }
 
@@ -223,6 +217,7 @@ static esp_err_t stream_get(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Pragma", "no-cache");
     httpd_resp_set_hdr(req, "Expires", "0");
     httpd_resp_set_hdr(req, "X-Accel-Buffering", "no");
+    httpd_resp_set_hdr(req, "Connection", "close");
     esp_err_t res = httpd_resp_set_type(req, "multipart/x-mixed-replace; boundary=frame");
     if (res != ESP_OK) {
         return res;
@@ -244,7 +239,6 @@ static esp_err_t stream_get(httpd_req_t *req)
     return ESP_OK;
 }
 
-/** GET /audio — endless chunked body of raw s16le stereo PCM (~48 kHz). */
 static void audio_worker_task(void *arg)
 {
     httpd_req_t *req = (httpd_req_t *)arg;
@@ -263,7 +257,7 @@ static void audio_worker_task(void *arg)
             break;
         }
     }
-    httpd_resp_sendstr_chunk(req, NULL);
+    (void)httpd_resp_sendstr_chunk(req, NULL);
     (void)httpd_req_async_handler_complete(req);
     vTaskDelete(NULL);
 }
@@ -271,12 +265,12 @@ static void audio_worker_task(void *arg)
 static esp_err_t audio_get(httpd_req_t *req)
 {
     if (!i2s_audio_ready()) {
-        /* IDF 5.4 has no HTTPD_503_* enum; use custom status string. */
         return httpd_resp_send_custom_err(req, "503 Service Unavailable", "audio disabled or not ready");
     }
     httpd_resp_set_type(req, "application/octet-stream");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     httpd_resp_set_hdr(req, "X-BabelBus-Audio", "s16le,2ch,48000");
+    httpd_resp_set_hdr(req, "Connection", "close");
 
     httpd_req_t *async_req = NULL;
     if (httpd_req_async_handler_begin(req, &async_req) != ESP_OK) {
@@ -293,15 +287,15 @@ static esp_err_t audio_get(httpd_req_t *req)
 httpd_handle_t http_server_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    /* max_req_hdr_len is IDF 5.5+; on 5.4 use Kconfig HTTPD_MAX_REQ_HDR_LEN instead */
     cfg.server_port = 80;
-    cfg.stack_size = 20 * 1024;
+    cfg.stack_size = 16 * 1024;
     cfg.task_priority = tskIDLE_PRIORITY + 6;
-    cfg.send_wait_timeout = 30;
-    cfg.keep_alive_enable = true;
+    cfg.send_wait_timeout = 5;
+    cfg.recv_wait_timeout = 5;
+    cfg.keep_alive_enable = false;
     cfg.uri_match_fn = httpd_uri_match_wildcard;
-    cfg.lru_purge_enable = false;
-    cfg.max_open_sockets = 12;
+    cfg.lru_purge_enable = true;
+    cfg.max_open_sockets = 8;
     cfg.max_uri_handlers = 12;
 
     httpd_handle_t h = NULL;
