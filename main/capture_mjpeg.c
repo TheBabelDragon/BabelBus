@@ -27,7 +27,6 @@ void capture_mjpeg_run(capture_ctx_t *c)
     jpeg_encode_engine_cfg_t jcfg = {.intr_priority = 0, .timeout_ms = 500};
     ESP_ERROR_CHECK(jpeg_new_encoder_engine(&jcfg, &s_jpeg_enc));
 
-    /* Size JPEG slots for max resolution so dynamic res works. */
     const size_t jpeg_cap = (size_t)CAPTURE_MAX_H * (size_t)CAPTURE_MAX_V + 384u * 1024u;
     jpeg_encode_memory_alloc_cfg_t jmem = {.buffer_direction = JPEG_ENC_ALLOC_OUTPUT_BUFFER};
     size_t smallest_alloc = SIZE_MAX;
@@ -58,9 +57,11 @@ void capture_mjpeg_run(capture_ctx_t *c)
         vTaskDelete(NULL);
         return;
     }
+    ESP_LOGI(CAPTURE_LOG_TAG, "JPEG path ready — waiting for CSI frames");
 
     const unsigned bpp = capture_csi_bpp();
     int64_t hdmi_recover_cooldown_until_us = 0;
+    uint32_t last_logged_done = 0;
 
     while (1) {
         if (xSemaphoreTake(c->csi_done_sem, pdMS_TO_TICKS(2000)) != pdTRUE) {
@@ -83,6 +84,19 @@ void capture_mjpeg_run(capture_ctx_t *c)
             continue;
         }
         ESP_ERROR_CHECK(esp_cache_msync(src, c->frame_bytes, ESP_CACHE_MSYNC_FLAG_DIR_M2C));
+
+        if (c->csi_dma_done_irqs == 1 ||
+            (c->csi_dma_done_irqs - last_logged_done) >= 300u) {
+            const uint8_t *p = (const uint8_t *)src;
+            uint32_t sum = 0;
+            for (size_t i = 0; i < 256 && i < c->frame_bytes; i++) {
+                sum += p[i];
+            }
+            ESP_LOGI(CAPTURE_LOG_TAG, "frame ok done=%lu jpeg_seq=%lu %ux%u pixsum256=%lu",
+                     (unsigned long)c->csi_dma_done_irqs, (unsigned long)g_jpeg_frame.frame_seq,
+                     (unsigned)c->hres, (unsigned)c->vres, (unsigned long)sum);
+            last_logged_done = c->csi_dma_done_irqs;
+        }
 
         uint8_t q = g_jpeg_frame.jpeg_quality;
         if (q < 1u) {
