@@ -4,7 +4,6 @@
  *
  * Waveshare ESP32-P4-WIFI6-DEV-KIT Rev 1.1 + Waveshare HDMI to CSI Adapter
  * RGB888 CSI (DT 0x24). CSI controller sized to active HDMI timing.
- * Buffers allocated for 1920x1080 so resolution can grow on recover.
  */
 #include "capture_priv.h"
 
@@ -47,9 +46,9 @@ static bool s_cam_started;
 static bool s_isp_created;
 static const uint32_t s_csi_expected_dt = 0x24u;
 static capture_ctx_t s_cap;
-/* CSI controller is created at this size — must match active HDMI for DMA to complete. */
 static uint32_t s_cam_h;
 static uint32_t s_cam_v;
+static int s_soft_fail_streak;
 
 static void tc358743_resetn_pulse(void)
 {
@@ -263,7 +262,6 @@ static bool IRAM_ATTR cam_on_done(esp_cam_ctlr_handle_t h, esp_cam_ctlr_trans_t 
     return woken;
 }
 
-/** Tear down and rebuild CSI+ISP at a new active size (resolution change). */
 static esp_err_t recreate_csi_at_size(capture_ctx_t *c, uint32_t hres, uint32_t vres)
 {
     if (s_cam_started && s_cam) {
@@ -435,7 +433,6 @@ capture_ctx_t *capture_hw_init_start(void)
     ESP_LOGI(CAPTURE_LOG_TAG, "MIPI lane %u Mbps RGB888 DT=0x24 active=%ux%u",
              (unsigned)P4KVM_MIPI_LANE_MBPS, (unsigned)s_cap.hres, (unsigned)s_cap.vres);
 
-    /* CSI must be created at the ACTIVE size or DMA never completes. */
     esp_cam_ctlr_csi_config_t csi_cfg = {
         .ctlr_id = 0,
         .clk_src = MIPI_CSI_PHY_CLK_SRC_DEFAULT,
@@ -493,7 +490,23 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
 {
     ESP_RETURN_ON_FALSE(c && c->tc, ESP_ERR_INVALID_ARG, CAPTURE_LOG_TAG, "ctx");
 
-    ESP_LOGW(CAPTURE_LOG_TAG, "CSI recover: cam stop → HPD → timing → CSI → start");
+    /* Prefer soft kick while HDMI is still locked — HPD was killing the stream. */
+    if (tc_locked(c->tc) && s_soft_fail_streak < 3) {
+        ESP_LOGW(CAPTURE_LOG_TAG, "CSI soft recover (locked, no HPD) streak=%d", s_soft_fail_streak);
+        (void)tc358743_soft_kick(c->tc);
+        MIPI_CSI_BRIDGE.int_clr.val = 0x3fu;
+        capture_configure_p4_csi_bridge(c->hres, c->vres);
+        if (!s_cam_started && s_cam) {
+            if (esp_cam_ctlr_start(s_cam) == ESP_OK) {
+                s_cam_started = true;
+            }
+        }
+        s_soft_fail_streak++;
+        return ESP_OK;
+    }
+
+    s_soft_fail_streak = 0;
+    ESP_LOGW(CAPTURE_LOG_TAG, "CSI hard recover: cam stop → HPD → CSI → start");
 
     if (s_cam_started && s_cam) {
         (void)esp_cam_ctlr_stop(s_cam);
@@ -515,7 +528,6 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     uint32_t h = c->hres, v = c->vres;
     (void)read_hdmi_timing(c->tc, &h, &v);
 
-    /* Resolution changed → rebuild CSI at the new size. */
     if (h != s_cam_h || v != s_cam_v) {
         ESP_LOGI(CAPTURE_LOG_TAG, "resolution change %ux%u → %ux%u", (unsigned)s_cam_h,
                  (unsigned)s_cam_v, (unsigned)h, (unsigned)v);
