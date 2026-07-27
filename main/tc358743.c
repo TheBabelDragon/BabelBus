@@ -128,11 +128,9 @@ static const char *TAG = "tc358743";
 #define CSI_INT 0x0414
 #define CSI_ERR 0x044c
 #define HDMI_DVI 0x8550
-/** Captured AVI InfoFrame RAM (Linux tc358743_regs.h). */
 #define PK_AVI_0HEAD 0x8710
 #define PK_AVI_16BYTE 0x8723
 #define PK_AVI_LEN ((PK_AVI_16BYTE) - (PK_AVI_0HEAD) + 1)
-/** Measured input timing (TC9590XBG §6.7 same map as TC358743 on common boards). */
 #define HACT0 0x8582
 #define HACT1 0x8583
 #define VACT0 0x8588
@@ -266,7 +264,6 @@ void tc358743_cfg_defaults_waveshare_pi(tc358743_cfg_t *c)
     memset(c, 0, sizeof(*c));
     c->refclk_hz = P4KVM_TC358743_REFCLK_HZ;
     c->pll_prd = c->refclk_hz / 6000000u;
-    /* Must match esp_cam CSI lane_bit_rate_mbps (P4KVM_MIPI_LANE_MBPS). */
     const uint32_t bps_per_lane = (uint32_t)P4KVM_MIPI_LANE_MBPS * 1000000u;
     c->pll_fbd = (uint16_t)(bps_per_lane / c->refclk_hz * c->pll_prd);
     c->fifo_level = 374;
@@ -366,7 +363,6 @@ static void sleep_mode(tc358743_t *d, bool enable)
 static void enable_stream(tc358743_t *d, bool enable)
 {
     if (enable) {
-        /* Non-continuous MIPI clock: leave TXOPTIONCNTRL as set_csi() left it (0); matches p4kvm / Linux. */
         wr8(d, VI_MUTE, MASK_AUTO_MUTE);
     } else {
         wr8(d, VI_MUTE, MASK_AUTO_MUTE | MASK_VI_MUTE);
@@ -504,6 +500,7 @@ static void initial_setup(tc358743_t *d)
     wr16(d, FIFOCTL, pdata->fifo_level);
     set_ref_clk(d);
     wr8_and_or(d, DDC_CTL, (uint8_t)~MASK_DDC5V_MODE, pdata->ddc5v_mode & MASK_DDC5V_MODE);
+    /* EDID over DDC — source will read our RAM as a monitor */
     wr8_and_or(d, EDID_MODE, (uint8_t)~MASK_EDID_MODE, MASK_EDID_MODE_E_DDC);
 
     set_hdmi_phy(d);
@@ -516,7 +513,6 @@ static void initial_setup(tc358743_t *d)
     wr8(d, VOUT_SET3, MASK_VOUT_EXTCNT);
 }
 
-/** RGB888 Linux tc358743_set_csi_color_space(RGB888_1X24). */
 static void set_csi_color_space_rgb888_regs(tc358743_t *d)
 {
     wr8_and_or(d, VOUT_SET2, (uint8_t) ~(MASK_SEL422 | MASK_VOUT_422FIL_100), 0);
@@ -524,7 +520,6 @@ static void set_csi_color_space_rgb888_regs(tc358743_t *d)
     wr16_and_or(d, CONFCTL, (uint16_t)~MASK_YCBCRFMT, 0);
 }
 
-/** UYVY 16-bit Linux tc358743_set_csi_color_space(MEDIA_BUS_FMT_UYVY8_1X16). */
 static void set_csi_color_space_uyvy422_regs(tc358743_t *d)
 {
     wr8_and_or(d, VOUT_SET2, (uint8_t) ~(MASK_SEL422 | MASK_VOUT_422FIL_100),
@@ -588,7 +583,6 @@ static void set_csi_lanes(tc358743_t *d, unsigned lanes)
              ((lanes > 1) ? MASK_D1M_HSTXVREGEN : 0) | ((lanes > 2) ? MASK_D2M_HSTXVREGEN : 0) |
              ((lanes > 3) ? MASK_D3M_HSTXVREGEN : 0));
 
-    /* Linux tc358743 set_csi(): TXOPTIONCNTRL = 0 (non-continuous MIPI clock). */
     wr32(d, TXOPTIONCNTRL, 0);
     wr32(d, STARTCNTRL, MASK_START);
     wr32(d, CSI_START, MASK_STRT);
@@ -597,9 +591,7 @@ static void set_csi_lanes(tc358743_t *d, unsigned lanes)
 
     wr32(d, CSI_CONFW, MASK_MODE_SET | MASK_ADDRESS_CSI_CONTROL | MASK_CSI_MODE | MASK_TXHSMD | nol);
     wr32(d, CSI_CONFW, MASK_MODE_SET | MASK_ADDRESS_CSI_ERR_INTENA | MASK_TXBRK | MASK_QUNK | MASK_WCER | MASK_INER);
-
     wr32(d, CSI_CONFW, MASK_MODE_CLEAR | MASK_ADDRESS_CSI_ERR_HALT | MASK_TXBRK | MASK_QUNK);
-
     wr32(d, CSI_CONFW, MASK_MODE_SET | MASK_ADDRESS_CSI_INT_ENA | MASK_INTER);
 }
 
@@ -609,8 +601,8 @@ static void hpd_set(tc358743_t *d, bool on)
 }
 
 /**
- * Load EDID into internal RAM (HPD must stay low, source must not DDC during this).
- * Caller raises HPD after PLL/CSI and any other sink setup (Linux: delayed hotplug ~143 ms).
+ * Load the built-in 1080p EDID into the bridge RAM while HPD is low.
+ * Source must not be doing DDC during this window.
  */
 static void edid_write_builtin(tc358743_t *d)
 {
@@ -621,6 +613,24 @@ static void edid_write_builtin(tc358743_t *d)
         i2c_write_reg(d, EDID_RAM + i, tc358743_edid_bin + i, 128);
     }
     vTaskDelay(pdMS_TO_TICKS(10));
+    ESP_LOGI(TAG, "EDID loaded (%u bytes) — presenting as 1080p monitor", (unsigned)edid_len);
+}
+
+/**
+ * Present as a simple monitor: stream on, then HPD high so the source
+ * sees a sink, reads our EDID, and starts TMDS.
+ */
+static void present_as_monitor(tc358743_t *d)
+{
+    enable_stream(d, true);
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    /* Rising HPD edge = "monitor plugged in" */
+    hpd_set(d, true);
+    ESP_LOGI(TAG, "HPD asserted — source should see a 1080p monitor and start TMDS");
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    wr32(d, CSI_START, MASK_STRT);
 }
 
 esp_err_t tc358743_probe(i2c_master_bus_handle_t bus, const tc358743_cfg_t *cfg, tc358743_t **out_dev)
@@ -661,7 +671,6 @@ void tc358743_remove(tc358743_t *d)
 esp_err_t tc358743_read_chip_id(tc358743_t *d, uint16_t *chip_id)
 {
     ESP_RETURN_ON_FALSE(d && chip_id, ESP_ERR_INVALID_ARG, TAG, "args");
-    /* Same as Linux / older p4kvm: 0x0000 is common and not used for probe. */
     *chip_id = rd16(d, CHIPID);
     return ESP_OK;
 }
@@ -677,9 +686,15 @@ esp_err_t tc358743_init_streaming(tc358743_t *d)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
 
-    /* HPD low so the source does not DDC/EDID until we are ready (matches old bridge_init + Linux). */
+    /*
+     * Boot as a simple monitor:
+     *  1. HPD low  — source must not DDC yet
+     *  2. Full register setup + EDID into RAM
+     *  3. PLL / CSI ready
+     *  4. Caller raises HPD via tc358743_enable_hdmi_output()
+     */
     hpd_set(d, false);
-    vTaskDelay(pdMS_TO_TICKS(20));
+    vTaskDelay(pdMS_TO_TICKS(50));
 
     initial_setup(d);
     edid_write_builtin(d);
@@ -697,7 +712,6 @@ esp_err_t tc358743_init_streaming(tc358743_t *d)
     wr16(d, INTSTATUS, 0xffff);
     wr16(d, INTMASK, (uint16_t)(~(MASK_HDMI_MSK | MASK_CSI_MSK) & 0xffff));
 
-    /* HPD and enable_stream(true): call tc358743_enable_hdmi_output() before esp_cam_ctlr_start() so MIPI is active. */
     tc358743_debug_status(d);
     return ESP_OK;
 }
@@ -705,13 +719,7 @@ esp_err_t tc358743_init_streaming(tc358743_t *d)
 esp_err_t tc358743_enable_hdmi_output(tc358743_t *d)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
-    /* Same tail as old bridge_init: video FIFO on, then delayed hotplug edge. */
-    enable_stream(d, true);
-    vTaskDelay(pdMS_TO_TICKS(150));
-    hpd_set(d, true);
-    vTaskDelay(pdMS_TO_TICKS(50));
-    /* STRT after CONFCTL enables video, some boards leave CSI TX idle until this is rewritten. */
-    wr32(d, CSI_START, MASK_STRT);
+    present_as_monitor(d);
     tc358743_debug_status(d);
     return ESP_OK;
 }
@@ -719,19 +727,20 @@ esp_err_t tc358743_enable_hdmi_output(tc358743_t *d)
 esp_err_t tc358743_hdmi_hotplug_reset(tc358743_t *d)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
+    /*
+     * Full unplug → plug cycle so the source re-reads EDID and restarts TMDS.
+     * Same as physically unplugging and re-plugging an HDMI monitor.
+     */
+    ESP_LOGI(TAG, "HDMI hotplug reset (unplug → plug as 1080p monitor)");
     enable_stream(d, false);
     hpd_set(d, false);
-    vTaskDelay(pdMS_TO_TICKS(150));
+    vTaskDelay(pdMS_TO_TICKS(300));   /* long enough for source to notice unplug */
     return tc358743_enable_hdmi_output(d);
 }
 
 esp_err_t tc358743_reapply_csi_path_after_hdmi(tc358743_t *d)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
-    /*
-     * Programming CSI before TMDS can leave MIPI idle; reapply after lock.
-     * Note: VI_STATUS1==0 on TC9590-class maps means 444/24p/no GBD, not "no video"; use HAct/VAct.
-     */
     apply_csi_color_space(d);
     set_csi_lanes(d, d->cfg.lanes);
     wr32(d, CSI_START, MASK_STRT);
@@ -793,11 +802,6 @@ void tc358743_debug_stall_extras(tc358743_t *d)
     ESP_LOGW(TAG,
              "stall CSI_ERR=0x%08" PRIx32 " (Linux: INER=0x200 WCER=0x100 QUNK=0x10 TXBRK=0x2)", csi_err);
 
-    /*
-     * TC9590XBG Table 4-2 / §6.8: contiguous read from PK_AVI_0HEAD (0x8710) yields
-     * avi[0..2]=HB0..2, avi[3]=checksum, avi[4]=PB0, avi[5]=PB1, ... (CEA-861 payload).
-     * §4.2: YCbCr444 24bpp uses the same CSI-2 DataType as RGB888 (0x24); §4.3 Y→G Cr→R Cb→B.
-     */
     uint8_t avi[24];
     memset(avi, 0, sizeof(avi));
     esp_err_t er = i2c_read_reg(d, PK_AVI_0HEAD, avi, PK_AVI_LEN);
@@ -808,13 +812,10 @@ void tc358743_debug_stall_extras(tc358743_t *d)
     ESP_LOG_BUFFER_HEX_LEVEL(TAG, avi, PK_AVI_LEN, ESP_LOG_WARN);
     if (PK_AVI_LEN >= 4u) {
         ESP_LOGW(TAG,
-                 "stall AVI layout (Table 4-2): HB=[%02x %02x %02x] chksum=%02x PB0=%02x PB1=%02x PB2=%02x PB3=%02x",
+                 "stall AVI layout: HB=[%02x %02x %02x] chksum=%02x PB0=%02x PB1=%02x PB2=%02x PB3=%02x",
                  avi[0], avi[1], avi[2], avi[3], avi[4], avi[5], avi[6], avi[7]);
     }
-    ESP_LOGW(TAG,
-             "stall MIPI note (§4.2): RGB888 and HDMI YCbCr444 24bpp both use DT 0x24: esp_cam RGB888 matches 444-out");
 
-    /* CEA-861 AVI v2: PB1 Y2:Y1:Y0 = bits 7..5 of avi[5]; PB4 VIC = avi[8] bits 6..0 */
     if (avi[0] == 0x82u && avi[2] >= 2u && PK_AVI_LEN >= 6u) {
         uint8_t pb1 = avi[5];
         unsigned y = (unsigned)(pb1 >> 5) & 7u;
@@ -823,10 +824,10 @@ void tc358743_debug_stall_extras(tc358743_t *d)
         ESP_LOGW(TAG, "stall AVI CEA: PB1 Y=%u (%s)", y, ys);
         if (PK_AVI_LEN > 8u) {
             unsigned vic = (unsigned)(avi[8] & 0x7fu);
-            ESP_LOGW(TAG, "stall AVI CEA: PB4 VIC=%u (0=unspecified per packet)", vic);
+            ESP_LOGW(TAG, "stall AVI CEA: PB4 VIC=%u", vic);
         }
     }
-#endif /* CONFIG_P4KVM_TC358743_ADV_DEBUG */
+#endif
 }
 
 void tc358743_debug_bridge(tc358743_t *d)
@@ -854,7 +855,6 @@ void tc358743_debug_bridge(tc358743_t *d)
     uint16_t vact = 0, htotal = 0, vtotal = 0;
     uint16_t hact = tc358743_read_hact_vact_htotal(d, &vact, &htotal, &vtotal);
 
-    /* Bit layout per Linux tc358743_regs.h (matches Toshiba REF_01). */
     unsigned csi_hlt = (unsigned)(csi & 1u);
     unsigned csi_rxact = (unsigned)((csi >> 8) & 1u);
     unsigned csi_txact = (unsigned)((csi >> 9) & 1u);
@@ -871,7 +871,7 @@ void tc358743_debug_bridge(tc358743_t *d)
     ESP_LOGW(TAG,
              " CSI_STATUS=0x%04x (Hlt:%u RxAct:%u TxAct:%u WSync:%u) CSIctl=0x%04x CSIint=0x%04x (IntHlt:%u INTER:%u)",
              csi, csi_hlt, csi_rxact, csi_txact, csi_wsync, csi_ctl, csi_int, csi_int_hlt, csi_inter);
-#endif /* CONFIG_P4KVM_TC358743_ADV_DEBUG */
+#endif
 }
 
 esp_err_t tc358743_set_streaming(tc358743_t *d, bool on)
