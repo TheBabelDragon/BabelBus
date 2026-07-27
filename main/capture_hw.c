@@ -2,8 +2,7 @@
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * Waveshare ESP32-P4-WIFI6-DEV-KIT Rev 1.1
- * I2C: SDA=GPIO7 SCL=GPIO8, external pullups, UYVY CSI
+ * Waveshare ESP32-P4-WIFI6-DEV-KIT Rev 1.1 — CSI I2C GPIO7/8
  */
 #include "capture_priv.h"
 
@@ -67,13 +66,47 @@ static void tc358743_resetn_pulse(void)
 #endif
 }
 
-/** TMDS + SYNC only (same as original p4kvm path). */
+/** Scan 7-bit addresses; log every ACK (expect 0x0F TC358743, often 0x18 ES8311). */
+static void i2c_bus_scan(i2c_master_bus_handle_t bus)
+{
+    ESP_LOGI(CAPTURE_LOG_TAG, "I2C scan...");
+    int found = 0;
+    for (uint16_t addr = 1; addr < 0x7f; addr++) {
+        esp_err_t er = i2c_master_probe(bus, addr, 50);
+        if (er == ESP_OK) {
+            ESP_LOGI(CAPTURE_LOG_TAG, "  ACK at 0x%02x", (unsigned)addr);
+            found++;
+        }
+    }
+    if (found == 0) {
+        ESP_LOGE(CAPTURE_LOG_TAG, "I2C scan: no devices — SDA/SCL path dead");
+    } else {
+        ESP_LOGI(CAPTURE_LOG_TAG, "I2C scan: %d device(s)", found);
+    }
+}
+
+/**
+ * Real lock needs TMDS+SYNC, and SYS_STATUS must not be a mono-fill byte
+ * (0xDF/0x7F/...) which is what we get when register reads are junk.
+ * CHIPID is only used here to reject false lock — init is never aborted on it.
+ */
 static bool tc_locked(tc358743_t *tc)
 {
     uint8_t st = 0;
+    uint16_t id = 0;
     if (tc358743_sys_status(tc, &st) != ESP_OK) {
         return false;
     }
+    (void)tc358743_read_chip_id(tc, &id);
+
+    /* Mono-fill status (hi==lo in CHIPID, st matches) = not real HDMI lock */
+    if ((id & 0xffu) == ((id >> 8) & 0xffu) && (id & 0xffu) != 0) {
+        return false;
+    }
+    if (st == 0xdfu || st == 0x7fu || st == 0x9fu || st == 0xf7u || st == 0xfdu) {
+        return false;
+    }
+
     return ((st & 0x02) != 0) && ((st & 0x80) != 0);
 }
 
@@ -94,8 +127,9 @@ static void wait_hdmi_lock(tc358743_t *tc, uint32_t timeout_ms)
             tc358743_debug_status(tc);
         }
     }
-    ESP_LOGW(CAPTURE_LOG_TAG, "HDMI lock timeout");
+    ESP_LOGW(CAPTURE_LOG_TAG, "HDMI lock timeout (SYS fill cannot count as lock)");
     tc358743_debug_status(tc);
+    tc358743_log_link_state(tc);
 }
 
 void capture_debug_csi_timeout(capture_ctx_t *c, unsigned bpp, size_t fb_bytes)
@@ -182,6 +216,7 @@ capture_ctx_t *capture_hw_init_start(void)
         .flags = {.enable_internal_pullup = false},
     };
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus));
+    i2c_bus_scan(i2c_bus);
 
     ESP_ERROR_CHECK(tc358743_probe(i2c_bus, NULL, &s_cap.tc));
     ESP_ERROR_CHECK(tc358743_init_streaming(s_cap.tc));
