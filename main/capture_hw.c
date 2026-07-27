@@ -42,7 +42,6 @@ static esp_cam_ctlr_handle_t s_cam;
 static isp_proc_handle_t s_isp_bypass;
 static bool s_cam_started;
 
-/* CSI-2 YUV422 8-bit (UYVY) user data type */
 static const uint32_t s_csi_expected_dt = 0x1Eu;
 
 static capture_ctx_t s_cap;
@@ -59,10 +58,11 @@ static void tc358743_resetn_pulse(void)
         .intr_type = GPIO_INTR_DISABLE,
     };
     ESP_ERROR_CHECK(gpio_config(&io));
+    /* Active-low RESETN: hold longer so a previously poisoned chip fully POR. */
     gpio_set_level(rst, 0);
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(50));
     gpio_set_level(rst, 1);
-    vTaskDelay(pdMS_TO_TICKS(200));
+    vTaskDelay(pdMS_TO_TICKS(250));
     ESP_LOGI(CAPTURE_LOG_TAG, "TC358743 RESETN released on GPIO %d", rst);
 #else
     ESP_LOGW(CAPTURE_LOG_TAG, "TC358743 RESETN not wired - waiting 500 ms for internal POR");
@@ -70,10 +70,19 @@ static void tc358743_resetn_pulse(void)
 #endif
 }
 
+/** 0x7F/0xFF on SYS_STATUS is I2C garbage, not HDMI lock. */
+static bool tc_status_is_garbage(uint8_t st)
+{
+    return st == 0x7fu || st == 0xffu;
+}
+
 static bool tc_has_pixel_stream(tc358743_t *tc)
 {
     uint8_t st = 0;
     if (tc358743_sys_status(tc, &st) != ESP_OK) {
+        return false;
+    }
+    if (tc_status_is_garbage(st)) {
         return false;
     }
     return ((st & 0x02) != 0) && ((st & 0x80) != 0); /* TMDS + SYNC */
@@ -86,25 +95,31 @@ static void wait_tc358743_pixel_stream(tc358743_t *tc, uint32_t timeout_ms)
     ESP_LOGI(CAPTURE_LOG_TAG, "Waiting up to %" PRIu32 " ms for HDMI TMDS+SYNC...", timeout_ms);
     tc358743_debug_status(tc);
     while (waited < timeout_ms) {
-        if (tc_has_pixel_stream(tc)) {
-            uint8_t st = 0;
-            (void)tc358743_sys_status(tc, &st);
+        uint8_t st = 0;
+        (void)tc358743_sys_status(tc, &st);
+        if (tc_status_is_garbage(st)) {
+            if ((waited % 1000u) == 0u) {
+                ESP_LOGE(CAPTURE_LOG_TAG,
+                         "SYS_STATUS=0x%02x is I2C garbage — not HDMI; reseat CSI ribbon / check RESETN",
+                         st);
+            }
+        } else if (tc_has_pixel_stream(tc)) {
             ESP_LOGI(CAPTURE_LOG_TAG, "HDMI ready SYS_STATUS=0x%02x after %" PRIu32 " ms", st, waited);
             tc358743_debug_bridge(tc);
             return;
         }
         if (waited > 0 && (waited % 2000u) == 0u) {
-            ESP_LOGW(CAPTURE_LOG_TAG, "HDMI still unlocked after %" PRIu32 " ms", waited);
+            ESP_LOGW(CAPTURE_LOG_TAG, "HDMI still unlocked after %" PRIu32 " ms (st=0x%02x)", waited, st);
             tc358743_debug_status(tc);
-            tc358743_debug_bridge(tc);
+            if (!tc_status_is_garbage(st)) {
+                tc358743_debug_bridge(tc);
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(step));
         waited += step;
     }
-    ESP_LOGW(CAPTURE_LOG_TAG, "HDMI lock wait %" PRIu32 " ms - no TMDS/SYNC yet", timeout_ms);
+    ESP_LOGW(CAPTURE_LOG_TAG, "HDMI lock wait %" PRIu32 " ms ended without TMDS+SYNC", timeout_ms);
     tc358743_debug_status(tc);
-    tc358743_debug_bridge(tc);
-    tc358743_debug_stall_extras(tc);
 }
 
 static void hardened_hdmi_bringup(tc358743_t *tc)
@@ -117,6 +132,16 @@ static void hardened_hdmi_bringup(tc358743_t *tc)
     for (int i = 1; i <= attempts; i++) {
         ESP_LOGI(CAPTURE_LOG_TAG, "HPD/EDID attempt %d/%d", i, attempts);
         tc358743_debug_status(tc);
+
+        uint8_t st0 = 0;
+        (void)tc358743_sys_status(tc, &st0);
+        if (tc_status_is_garbage(st0)) {
+            ESP_LOGE(CAPTURE_LOG_TAG,
+                     "Attempt %d: I2C garbage (0x%02x) — re-pulse RESETN and skip poison RMW path",
+                     i, st0);
+            tc358743_resetn_pulse();
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
 
         if (i > 1) {
             esp_err_t er = tc358743_hdmi_hotplug_reset(tc);
@@ -131,9 +156,7 @@ static void hardened_hdmi_bringup(tc358743_t *tc)
             ESP_LOGI(CAPTURE_LOG_TAG, "HDMI locked on attempt %d/%d", i, attempts);
             return;
         }
-        ESP_LOGW(CAPTURE_LOG_TAG, "Attempt %d/%d: still no TMDS", i, attempts);
-        tc358743_debug_bridge(tc);
-        tc358743_debug_stall_extras(tc);
+        ESP_LOGW(CAPTURE_LOG_TAG, "Attempt %d/%d: no TMDS+SYNC yet", i, attempts);
     }
 
     ESP_LOGW(CAPTURE_LOG_TAG, "All %d HPD/EDID attempts failed", attempts);
@@ -176,14 +199,18 @@ void capture_debug_csi_timeout(capture_ctx_t *c, unsigned bpp, size_t fb_bytes)
     }
     if (c && c->tc) {
         tc358743_debug_status(c->tc);
-        tc358743_debug_bridge(c->tc);
-        tc358743_debug_stall_extras(c->tc);
+        uint8_t st = 0;
+        (void)tc358743_sys_status(c->tc, &st);
+        if (!tc_status_is_garbage(st)) {
+            tc358743_debug_bridge(c->tc);
+            tc358743_debug_stall_extras(c->tc);
+        }
     }
 }
 
 unsigned capture_csi_bpp(void)
 {
-    return 16u; /* UYVY */
+    return 16u;
 }
 
 void capture_fill_esp_cam_color_types(esp_cam_ctlr_csi_config_t *csi, esp_isp_processor_cfg_t *isp)
@@ -259,9 +286,23 @@ capture_ctx_t *capture_hw_init_start(void)
     ESP_ERROR_CHECK(tc358743_init_streaming(s_cap.tc));
     tc358743_set_csi_uyvy422(s_cap.tc, true);
 
+    {
+        uint8_t st = 0;
+        (void)tc358743_sys_status(s_cap.tc, &st);
+        if (tc_status_is_garbage(st)) {
+            ESP_LOGE(CAPTURE_LOG_TAG,
+                     "After init SYS_STATUS=0x%02x (I2C garbage). Reseat CSI ribbon, verify RESETN, power-cycle.",
+                     st);
+            tc358743_resetn_pulse();
+            vTaskDelay(pdMS_TO_TICKS(100));
+            (void)tc358743_sys_status(s_cap.tc, &st);
+            ESP_LOGE(CAPTURE_LOG_TAG, "After re-RESET SYS_STATUS=0x%02x", st);
+        }
+    }
+
     s_cap.hres = P4KVM_CSI_H_RES;
     s_cap.vres = P4KVM_CSI_V_RES;
-    s_cap.frame_bytes = (size_t)s_cap.hres * (size_t)s_cap.vres * 2u; /* UYVY */
+    s_cap.frame_bytes = (size_t)s_cap.hres * (size_t)s_cap.vres * 2u;
 
     size_t align = 0;
     ESP_ERROR_CHECK(esp_cache_get_alignment(MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA, &align));
@@ -330,11 +371,10 @@ capture_ctx_t *capture_hw_init_start(void)
     capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
 
     hardened_hdmi_bringup(s_cap.tc);
-    /* Re-apply UYVY after HPD cycles (init defaults to RGB then we force UYVY) */
     tc358743_set_csi_uyvy422(s_cap.tc, true);
 
     if (!tc_has_pixel_stream(s_cap.tc)) {
-        ESP_LOGW(CAPTURE_LOG_TAG, "No TMDS after hardened bring-up — starting CSI anyway");
+        ESP_LOGW(CAPTURE_LOG_TAG, "No TMDS+SYNC after bring-up — starting CSI anyway");
     }
 
     capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
@@ -362,7 +402,6 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     bool locked = tc_has_pixel_stream(c->tc);
     ESP_LOGW(CAPTURE_LOG_TAG, "HDMI recover (locked=%d)", (int)locked);
     tc358743_debug_status(c->tc);
-    tc358743_debug_bridge(c->tc);
 
     if (s_cam_started) {
         esp_err_t er = esp_cam_ctlr_stop(s_cam);
@@ -374,6 +413,7 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     capture_drain_csi_done_sem(c->csi_done_sem);
 
     if (!locked) {
+        tc358743_resetn_pulse();
         for (int i = 1; i <= 3; i++) {
             ESP_LOGI(CAPTURE_LOG_TAG, "Recover HPD attempt %d/3", i);
             esp_err_t er = tc358743_hdmi_hotplug_reset(c->tc);
@@ -394,10 +434,8 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     }
 
     if (!tc_has_pixel_stream(c->tc)) {
-        ESP_LOGW(CAPTURE_LOG_TAG, "Still no TMDS after hardened recover");
+        ESP_LOGW(CAPTURE_LOG_TAG, "Still no TMDS+SYNC after recover");
         tc358743_debug_status(c->tc);
-        tc358743_debug_bridge(c->tc);
-        tc358743_debug_stall_extras(c->tc);
         return ESP_ERR_INVALID_STATE;
     }
 
