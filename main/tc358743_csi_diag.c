@@ -1,8 +1,6 @@
 /*
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
- *
- * Stall-path diagnostics: is the TC358743 CSI TX actually alive?
  */
 #include "tc358743.h"
 
@@ -13,7 +11,6 @@
 
 static const char *TAG = "tc358743";
 
-/* Mirror of private regs — same addresses as tc358743.c */
 #define CONFCTL 0x0004
 #define SYSCTL 0x0002
 #define PLLCTL0 0x0020
@@ -33,7 +30,6 @@ static const char *TAG = "tc358743";
 
 struct tc358743 {
     i2c_master_dev_handle_t i2c;
-    /* rest opaque */
 };
 
 static esp_err_t diag_read(tc358743_t *d, uint16_t reg, void *data, size_t len)
@@ -112,12 +108,11 @@ void tc358743_debug_bridge(tc358743_t *d)
              clw, d0w, d1w);
 
     if (!vbufen) {
-        ESP_LOGE(TAG, "VBUFEN=0 — video FIFO off, no CSI packets will leave the chip");
+        ESP_LOGE(TAG, "VBUFEN=0 — video FIFO off");
     }
-    if (!txact && !wsync) {
-        ESP_LOGE(TAG, "TxAct=0 WSync=0 — CSI TX idle (not streaming HS data)");
-    } else if (txact) {
-        ESP_LOGW(TAG, "TxAct=1 — chip claims CSI TX active; if P4 int_raw=0, path is physical");
+    /* TxAct is pulsed during active video only; reading 0 during blanking is normal. */
+    if (!txact && !wsync && vbufen) {
+        ESP_LOGD(TAG, "TxAct=0 sample (blanking window OK if dma_done climbing)");
     }
 }
 
