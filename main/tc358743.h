@@ -60,6 +60,9 @@ esp_err_t tc358743_hdmi_hotplug_reset(tc358743_t *dev);
 
 esp_err_t tc358743_reapply_csi_path_after_hdmi(tc358743_t *dev);
 
+/** Soft re-kick (color + VBUFEN + CSI_START) — no CTXRST / HPD. */
+esp_err_t tc358743_soft_kick(tc358743_t *dev);
+
 void tc358743_debug_bridge(tc358743_t *dev);
 
 void tc358743_debug_stall_extras(tc358743_t *dev);
