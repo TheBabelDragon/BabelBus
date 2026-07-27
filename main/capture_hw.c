@@ -144,13 +144,11 @@ static void wait_hdmi_lock(tc358743_t *tc, uint32_t timeout_ms)
     tc358743_log_link_state(tc);
 }
 
-/** Prefer measured HDMI active size; fall back to compiled default. */
 static void resolve_capture_size(tc358743_t *tc, uint32_t *hres, uint32_t *vres)
 {
     uint16_t hact = 0, vact = 0;
     if (tc && tc358743_get_detected_timing(tc, &hact, &vact) == ESP_OK &&
         hact >= 320u && vact >= 240u && hact <= 1920u && vact <= 1080u) {
-        /* UYVY needs even width */
         if (hact & 1u) {
             hact--;
         }
@@ -165,7 +163,6 @@ static void resolve_capture_size(tc358743_t *tc, uint32_t *hres, uint32_t *vres)
     }
 }
 
-/** After TMDS lock: reprogram CSI TX on the bridge and log measured timing. */
 static void after_hdmi_lock(tc358743_t *tc)
 {
     uint16_t hact = 0, vact = 0;
@@ -305,7 +302,6 @@ capture_ctx_t *capture_hw_init_start(void)
         after_hdmi_lock(s_cap.tc);
     }
 
-    /* Size CSI to whatever the source is actually sending (e.g. 720x480). */
     resolve_capture_size(s_cap.tc, &s_cap.hres, &s_cap.vres);
     s_cap.frame_bytes = (size_t)s_cap.hres * (size_t)s_cap.vres * 2u;
 
@@ -383,6 +379,44 @@ capture_ctx_t *capture_hw_init_start(void)
 esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
 {
     ESP_RETURN_ON_FALSE(c && c->tc && s_cam, ESP_ERR_INVALID_ARG, CAPTURE_LOG_TAG, "ctx");
+
+    const bool locked = tc_locked(c->tc);
+
+    if (locked) {
+        /*
+         * HDMI is fine — do NOT HPD-cycle (that drops TMDS and undoes progress).
+         * Soft kick: re-enable stream + CSI TX, retune P4 bridge, restart cam if needed.
+         */
+        ESP_LOGW(CAPTURE_LOG_TAG, "CSI soft recover (HDMI still locked)");
+        tc358743_set_csi_uyvy422(c->tc, true);
+        (void)tc358743_reapply_csi_path_after_hdmi(c->tc);
+        (void)tc358743_set_streaming(c->tc, true);
+        capture_configure_p4_csi_bridge(c->hres, c->vres);
+        ISP.cntl.isp_en = 0;
+
+        if (s_cam_started) {
+            (void)esp_cam_ctlr_stop(s_cam);
+            s_cam_started = false;
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        c->ping_fb_idx = 0;
+        c->done_fb = NULL;
+        /* keep dma_done counter — useful for debugging */
+        c->csi_get_new_irqs = 0;
+        while (c->csi_done_sem && xSemaphoreTake(c->csi_done_sem, 0) == pdTRUE) {
+        }
+
+        esp_err_t er = esp_cam_ctlr_start(s_cam);
+        if (er == ESP_OK) {
+            s_cam_started = true;
+            (void)tc358743_reapply_csi_path_after_hdmi(c->tc);
+            (void)tc358743_set_streaming(c->tc, true);
+        }
+        return er;
+    }
+
+    /* Unlocked: full HPD cycle to wake the source. */
+    ESP_LOGW(CAPTURE_LOG_TAG, "CSI hard recover (HDMI unlocked — HPD cycle)");
     if (s_cam_started) {
         (void)esp_cam_ctlr_stop(s_cam);
         s_cam_started = false;
@@ -392,13 +426,13 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     if (tc_locked(c->tc)) {
         after_hdmi_lock(c->tc);
     }
-    /* Cam was created at init size; only retune bridge geometry if it still matches. */
     capture_configure_p4_csi_bridge(c->hres, c->vres);
     ISP.cntl.isp_en = 0;
     c->ping_fb_idx = 0;
     c->done_fb = NULL;
-    c->csi_dma_done_irqs = 0;
     c->csi_get_new_irqs = 0;
+    while (c->csi_done_sem && xSemaphoreTake(c->csi_done_sem, 0) == pdTRUE) {
+    }
     esp_err_t er = esp_cam_ctlr_start(s_cam);
     if (er == ESP_OK) {
         s_cam_started = true;
