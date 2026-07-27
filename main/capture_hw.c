@@ -3,8 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Waveshare ESP32-P4-WIFI6-DEV-KIT Rev 1.1 + Waveshare HDMI to CSI Adapter
- *
- * Path aligned with jrowny/p4kvm: RGB888 CSI (datatype 0x24), not UYVY.
+ * Path: RGB888 CSI (DT 0x24), same as working p4kvm.
  */
 #include "capture_priv.h"
 
@@ -163,6 +162,12 @@ static void after_hdmi_lock(tc358743_t *tc)
     (void)tc358743_reapply_csi_path_after_hdmi(tc);
     (void)tc358743_set_streaming(tc, true);
     ESP_LOGI(CAPTURE_LOG_TAG, "CSI path reapplied after HDMI lock (RGB888)");
+}
+
+static void drain_done_sem(capture_ctx_t *c)
+{
+    while (c->csi_done_sem && xSemaphoreTake(c->csi_done_sem, 0) == pdTRUE) {
+    }
 }
 
 void capture_debug_csi_timeout(capture_ctx_t *c, unsigned bpp, size_t fb_bytes)
@@ -381,36 +386,48 @@ capture_ctx_t *capture_hw_init_start(void)
 esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
 {
     ESP_RETURN_ON_FALSE(c && c->tc && s_cam, ESP_ERR_INVALID_ARG, CAPTURE_LOG_TAG, "ctx");
+
     const bool locked = tc_locked(c->tc);
-    if (locked) {
-        ESP_LOGW(CAPTURE_LOG_TAG, "CSI soft recover (stream re-assert only, no CTXRST)");
-        capture_configure_p4_csi_bridge(c->hres, c->vres);
-        ISP.cntl.isp_en = 0;
-        tc358743_set_csi_uyvy422(c->tc, false);
-        (void)tc358743_set_streaming(c->tc, true);
-        return ESP_OK;
-    }
-    ESP_LOGW(CAPTURE_LOG_TAG, "CSI hard recover (HDMI unlocked — HPD cycle)");
+
+    /*
+     * Even when HDMI is still locked, a long run can leave esp_cam with no
+     * queued buffers (done stuck). Always stop → drain → start the cam.
+     * Only do HPD when HDMI is actually unlocked.
+     */
+    ESP_LOGW(CAPTURE_LOG_TAG, "CSI recover (locked=%d): cam stop → requeue → start",
+             (int)locked);
+
     if (s_cam_started) {
         (void)esp_cam_ctlr_stop(s_cam);
         s_cam_started = false;
     }
-    (void)tc358743_hdmi_hotplug_reset(c->tc);
-    wait_hdmi_lock(c->tc, 5000);
-    if (tc_locked(c->tc)) {
-        after_hdmi_lock(c->tc);
-    }
-    capture_configure_p4_csi_bridge(c->hres, c->vres);
-    ISP.cntl.isp_en = 0;
+    drain_done_sem(c);
     c->ping_fb_idx = 0;
     c->done_fb = NULL;
-    c->csi_get_new_irqs = 0;
-    while (c->csi_done_sem && xSemaphoreTake(c->csi_done_sem, 0) == pdTRUE) {
+
+    if (!locked) {
+        (void)tc358743_hdmi_hotplug_reset(c->tc);
+        wait_hdmi_lock(c->tc, 5000);
+        if (tc_locked(c->tc)) {
+            after_hdmi_lock(c->tc);
+        }
+    } else {
+        tc358743_set_csi_uyvy422(c->tc, false);
+        (void)tc358743_reapply_csi_path_after_hdmi(c->tc);
+        (void)tc358743_set_streaming(c->tc, true);
     }
+
+    capture_configure_p4_csi_bridge(c->hres, c->vres);
+    ISP.cntl.isp_en = 0;
+    MIPI_CSI_BRIDGE.int_clr.val = 0x3fu;
+
     esp_err_t er = esp_cam_ctlr_start(s_cam);
     if (er == ESP_OK) {
         s_cam_started = true;
         (void)tc358743_set_streaming(c->tc, true);
+        ESP_LOGI(CAPTURE_LOG_TAG, "CSI recover: cam restarted");
+    } else {
+        ESP_LOGE(CAPTURE_LOG_TAG, "CSI recover: cam start failed %s", esp_err_to_name(er));
     }
     return er;
 }
