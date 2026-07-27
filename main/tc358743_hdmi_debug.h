@@ -2,20 +2,17 @@
 #pragma once
 
 #include "esp_log.h"
+#include "i2c_guard.h"
 #include "tc358743.h"
 
 /**
  * Linux tc358743_regs.h SYS_STATUS (0x8520):
  *  bit0 DDC5V  bit1 TMDS  bit2 PHY_PLL  bit3 PHY_SCDT
  *  bit4 HDMI   bit5 HDCP  bit6 AVMUTE  bit7 SYNC
- *
- * Stuck I2C fill patterns observed when CSI ribbon / bus is bad:
- *   0x7F, 0x97, 0xFF on *every* register + AVI ESP_ERR_INVALID_RESPONSE.
- * Do NOT treat 0x00 as garbage — that is normal with HDMI unplugged.
  */
 static inline bool tc358743_status_looks_like_i2c_garbage(uint8_t st)
 {
-    return st == 0x7fu || st == 0x97u || st == 0xffu;
+    return tc358743_byte_is_bus_garbage(st);
 }
 
 static inline void tc358743_debug_status(tc358743_t *dev)
@@ -42,8 +39,9 @@ static inline void tc358743_debug_status(tc358743_t *dev)
 
     if (tc358743_status_looks_like_i2c_garbage(st)) {
         ESP_LOGE("tc358743",
-                 "SYS_STATUS 0x%02x is a stuck I2C fill (CONFCTL/VI often match; AVI INVALID_RESPONSE). "
-                 "Reseat CSI ribbon (SDA/SCL), check RESETN, power-cycle. Not an HDMI lock.",
+                 "SYS_STATUS 0x%02x is I2C stuck-fill (unplugged still shows this; AVI often "
+                 "ESP_ERR_INVALID_RESPONSE). Reseat CSI ribbon SDA/SCL, check RESETN, power-cycle. "
+                 "NOT source HDCP/mute.",
                  st);
         return;
     }
