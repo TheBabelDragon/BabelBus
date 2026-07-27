@@ -2,8 +2,7 @@
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * Continuous MIPI clock (CONTCLKMODE=1). Empirically required on this board:
- * non-continuous left CSI TX idle; continuous delivered ~2000 frames.
+ * Continuous MIPI clock. VI_MUTE forced clear on stream-on (solid 0x80 was blank).
  */
 #include "tc358743.h"
 
@@ -122,21 +121,9 @@ static const char *TAG = "tc358743";
 #define MASK_HPD_OUT0 0x01
 
 #define SYS_STATUS 0x8520
-#define CSI_STATUS 0x0410
-#define CSI_CONTROL 0x040c
-#define CSI_INT 0x0414
-#define CSI_ERR 0x044c
 #define PK_AVI_0HEAD 0x8710
 #define PK_AVI_16BYTE 0x8723
 #define PK_AVI_LEN ((PK_AVI_16BYTE) - (PK_AVI_0HEAD) + 1)
-#define HACT0 0x8582
-#define HACT1 0x8583
-#define VACT0 0x8588
-#define VACT1 0x8589
-#define HTOTAL0 0x858a
-#define HTOTAL1 0x858b
-#define VTOTAL0 0x858c
-#define VTOTAL1 0x858d
 #define PHY_EN 0x8534
 #define MASK_ENABLE_PHY 0x01
 #define PHY_CTL0 0x8531
@@ -354,7 +341,6 @@ static void sleep_mode(tc358743_t *d, bool enable)
     wr16_and_or(d, SYSCTL, (uint16_t)~MASK_SLEEP, enable ? MASK_SLEEP : 0);
 }
 
-/** Kick continuous clock: LP11 (0) then CONTCLK (1). */
 static void csi_force_contclk(tc358743_t *d)
 {
     wr32(d, TXOPTIONCNTRL, 0);
@@ -365,7 +351,8 @@ static void csi_force_contclk(tc358743_t *d)
 static void enable_stream(tc358743_t *d, bool enable)
 {
     if (enable) {
-        wr8(d, VI_MUTE, MASK_AUTO_MUTE);
+        /* Force full unmute — AUTO_MUTE alone left solid 0x80 blank frames. */
+        wr8(d, VI_MUTE, 0);
     } else {
         wr8(d, VI_MUTE, MASK_AUTO_MUTE | MASK_VI_MUTE);
     }
@@ -457,9 +444,8 @@ static void set_hdmi_phy(tc358743_t *d)
 static void set_hdmi_audio(tc358743_t *d)
 {
     wr8(d, FORCE_MUTE, 0x00);
-    wr8(d, AUTO_CMD0,
-        MASK_AUTO_MUTE7 | MASK_AUTO_MUTE6 | MASK_AUTO_MUTE5 | MASK_AUTO_MUTE4 | MASK_AUTO_MUTE1 | MASK_AUTO_MUTE0);
-    wr8(d, AUTO_CMD1, MASK_AUTO_MUTE9);
+    wr8(d, AUTO_CMD0, 0);
+    wr8(d, AUTO_CMD1, 0);
     wr8(d, AUTO_CMD2, MASK_AUTO_PLAY3 | MASK_AUTO_PLAY2);
     wr8(d, BUFINIT_START, SET_BUFINIT_START_MS(500));
     wr8(d, FS_MUTE, 0x00);
@@ -673,7 +659,8 @@ esp_err_t tc358743_enable_hdmi_output(tc358743_t *d)
     hpd_set(d, true);
     vTaskDelay(pdMS_TO_TICKS(50));
     csi_force_contclk(d);
-    ESP_LOGI(TAG, "HPD asserted, continuous MIPI clock");
+    wr8(d, VI_MUTE, 0);
+    ESP_LOGI(TAG, "HPD asserted, continuous clock, VI_MUTE=0");
     tc358743_debug_status(d);
     return ESP_OK;
 }
@@ -695,6 +682,7 @@ esp_err_t tc358743_reapply_csi_path_after_hdmi(tc358743_t *d)
     set_csi_lanes(d, d->cfg.lanes);
     enable_stream(d, true);
     csi_force_contclk(d);
+    wr8(d, VI_MUTE, 0);
     return ESP_OK;
 }
 
@@ -724,6 +712,7 @@ esp_err_t tc358743_set_streaming(tc358743_t *d, bool on)
         set_csi_lanes(d, d->cfg.lanes);
     } else {
         csi_force_contclk(d);
+        wr8(d, VI_MUTE, 0);
     }
     return ESP_OK;
 }
