@@ -3,11 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Waveshare ESP32-P4-WIFI6-DEV-KIT Rev 1.1 + Waveshare HDMI to CSI Adapter
- * Path: RGB888 CSI (DT 0x24), same as working p4kvm.
+ * RGB888 CSI (DT 0x24). Dynamic resolution: buffers sized for 1920x1080 max.
  */
 #include "capture_priv.h"
 
 #include <inttypes.h>
+#include <string.h>
 
 #include "p4kvm_hw_defaults.h"
 #include "esp_cache.h"
@@ -107,7 +108,6 @@ static bool tc_locked(tc358743_t *tc)
     if (st == 0xffu || st == 0xdfu || st == 0x7fu || st == 0x9fu || st == 0xf7u || st == 0xfdu) {
         return false;
     }
-    /* TMDS (bit1) + SCDT (bit3) + SYNC (bit7). DDC5V is accurate on this board but not required. */
     return ((st & 0x02) != 0) && ((st & 0x08) != 0) && ((st & 0x80) != 0);
 }
 
@@ -133,31 +133,40 @@ static void wait_hdmi_lock(tc358743_t *tc, uint32_t timeout_ms)
     tc358743_log_link_state(tc);
 }
 
-static void resolve_capture_size(tc358743_t *tc, uint32_t *hres, uint32_t *vres)
+static bool read_hdmi_timing(tc358743_t *tc, uint32_t *hres, uint32_t *vres)
 {
     uint16_t hact = 0, vact = 0;
-    if (tc && tc358743_get_detected_timing(tc, &hact, &vact) == ESP_OK &&
-        hact >= 320u && vact >= 240u && hact <= 1920u && vact <= 1080u) {
-        if (hact & 1u) {
-            hact--;
-        }
-        *hres = hact;
-        *vres = vact;
+    if (!tc || tc358743_get_detected_timing(tc, &hact, &vact) != ESP_OK) {
+        return false;
+    }
+    if (hact < 320u || vact < 240u || hact > CAPTURE_MAX_H || vact > CAPTURE_MAX_V) {
+        return false;
+    }
+    if (hact & 1u) {
+        hact--;
+    }
+    *hres = hact;
+    *vres = vact;
+    return true;
+}
+
+static void resolve_capture_size(tc358743_t *tc, uint32_t *hres, uint32_t *vres)
+{
+    if (read_hdmi_timing(tc, hres, vres)) {
         ESP_LOGI(CAPTURE_LOG_TAG, "CSI sized to HDMI timing %ux%u", (unsigned)*hres, (unsigned)*vres);
     } else {
-        *hres = P4KVM_CSI_H_RES;
-        *vres = P4KVM_CSI_V_RES;
-        ESP_LOGW(CAPTURE_LOG_TAG, "CSI sized to default %ux%u (no valid HDMI timing)",
+        *hres = 720u;
+        *vres = 480u;
+        ESP_LOGW(CAPTURE_LOG_TAG, "CSI sized to fallback %ux%u (no valid HDMI timing)",
                  (unsigned)*hres, (unsigned)*vres);
     }
 }
 
 static void after_hdmi_lock(tc358743_t *tc)
 {
-    uint16_t hact = 0, vact = 0;
-    if (tc358743_get_detected_timing(tc, &hact, &vact) == ESP_OK) {
-        ESP_LOGI(CAPTURE_LOG_TAG, "HDMI timing HAct=%u VAct=%u",
-                 (unsigned)hact, (unsigned)vact);
+    uint32_t h = 0, v = 0;
+    if (read_hdmi_timing(tc, &h, &v)) {
+        ESP_LOGI(CAPTURE_LOG_TAG, "HDMI timing HAct=%u VAct=%u", (unsigned)h, (unsigned)v);
     }
     tc358743_set_csi_uyvy422(tc, false);
     (void)tc358743_reapply_csi_path_after_hdmi(tc);
@@ -169,6 +178,39 @@ static void drain_done_sem(capture_ctx_t *c)
 {
     while (c->csi_done_sem && xSemaphoreTake(c->csi_done_sem, 0) == pdTRUE) {
     }
+}
+
+static void capture_configure_p4_csi_bridge(uint32_t hres, uint32_t vres)
+{
+    MIPI_CSI_BRIDGE.frame_cfg.hadr_num = hres;
+    MIPI_CSI_BRIDGE.frame_cfg.vadr_num = vres;
+    MIPI_CSI_BRIDGE.frame_cfg.has_hsync_e = 0u;
+    MIPI_CSI_BRIDGE.frame_cfg.vadr_num_check = 0u;
+    MIPI_CSI_BRIDGE.data_type_cfg.data_type_min = s_csi_expected_dt;
+    MIPI_CSI_BRIDGE.data_type_cfg.data_type_max = s_csi_expected_dt;
+    MIPI_CSI_BRIDGE.int_clr.val = 0x3fu;
+}
+
+/** Apply new active size into context + bridge (buffers already max-sized). */
+static bool apply_active_size(capture_ctx_t *c, uint32_t hres, uint32_t vres)
+{
+    size_t need = (size_t)hres * (size_t)vres * 3u;
+    if (need > c->fb_alloc_bytes) {
+        ESP_LOGE(CAPTURE_LOG_TAG, "timing %ux%u needs %zu bytes > alloc %zu — skipped",
+                 (unsigned)hres, (unsigned)vres, need, c->fb_alloc_bytes);
+        return false;
+    }
+    if (c->hres == hres && c->vres == vres && c->frame_bytes == need) {
+        capture_configure_p4_csi_bridge(hres, vres);
+        return true;
+    }
+    ESP_LOGI(CAPTURE_LOG_TAG, "resolution %ux%u → %ux%u (fb=%zu)",
+             (unsigned)c->hres, (unsigned)c->vres, (unsigned)hres, (unsigned)vres, need);
+    c->hres = hres;
+    c->vres = vres;
+    c->frame_bytes = need;
+    capture_configure_p4_csi_bridge(hres, vres);
+    return true;
 }
 
 void capture_debug_csi_timeout(capture_ctx_t *c, unsigned bpp, size_t fb_bytes)
@@ -189,10 +231,10 @@ void capture_debug_csi_timeout(capture_ctx_t *c, unsigned bpp, size_t fb_bytes)
     if (c && c->tc) {
         tc358743_debug_status(c->tc);
         tc358743_debug_bridge(c->tc);
-        uint16_t hact = 0, vact = 0;
-        if (tc358743_get_detected_timing(c->tc, &hact, &vact) == ESP_OK) {
+        uint32_t h = 0, v = 0;
+        if (read_hdmi_timing(c->tc, &h, &v)) {
             ESP_LOGW(CAPTURE_LOG_TAG, "stall timing HAct=%u VAct=%u (CSI %ux%u)",
-                     (unsigned)hact, (unsigned)vact, (unsigned)c->hres, (unsigned)c->vres);
+                     (unsigned)h, (unsigned)v, (unsigned)c->hres, (unsigned)c->vres);
         }
     }
 }
@@ -208,17 +250,6 @@ void capture_fill_esp_cam_color_types(esp_cam_ctlr_csi_config_t *csi, esp_isp_pr
     csi->output_data_color_type = CAM_CTLR_COLOR_RGB888;
     isp->input_data_color_type = ISP_COLOR_RGB888;
     isp->output_data_color_type = ISP_COLOR_RGB888;
-}
-
-static void capture_configure_p4_csi_bridge(uint32_t hres, uint32_t vres)
-{
-    MIPI_CSI_BRIDGE.frame_cfg.hadr_num = hres;
-    MIPI_CSI_BRIDGE.frame_cfg.vadr_num = vres;
-    MIPI_CSI_BRIDGE.frame_cfg.has_hsync_e = 0u;
-    MIPI_CSI_BRIDGE.frame_cfg.vadr_num_check = 0u;
-    MIPI_CSI_BRIDGE.data_type_cfg.data_type_min = s_csi_expected_dt;
-    MIPI_CSI_BRIDGE.data_type_cfg.data_type_max = s_csi_expected_dt;
-    MIPI_CSI_BRIDGE.int_clr.val = 0x3fu;
 }
 
 static bool IRAM_ATTR cam_on_get_new(esp_cam_ctlr_handle_t h, esp_cam_ctlr_trans_t *trans, void *ud)
@@ -307,36 +338,41 @@ capture_ctx_t *capture_hw_init_start(void)
 
     resolve_capture_size(s_cap.tc, &s_cap.hres, &s_cap.vres);
     s_cap.frame_bytes = (size_t)s_cap.hres * (size_t)s_cap.vres * 3u;
+    /* Always allocate max so resolution can change without realloc. */
+    s_cap.fb_alloc_bytes = (size_t)CAPTURE_MAX_H * (size_t)CAPTURE_MAX_V * 3u;
 
     size_t align = 0;
     ESP_ERROR_CHECK(esp_cache_get_alignment(MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA, &align));
-    uint8_t *blk = heap_caps_aligned_calloc(align, CAPTURE_FB_COUNT, s_cap.frame_bytes,
+    uint8_t *blk = heap_caps_aligned_calloc(align, CAPTURE_FB_COUNT, s_cap.fb_alloc_bytes,
                                             MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!blk) {
-        ESP_LOGE(CAPTURE_LOG_TAG, "FB alloc fail (%ux%u RGB888)", (unsigned)s_cap.hres, (unsigned)s_cap.vres);
+        ESP_LOGE(CAPTURE_LOG_TAG, "FB alloc fail (max %ux%u RGB888)", CAPTURE_MAX_H, CAPTURE_MAX_V);
         vTaskDelete(NULL);
         return NULL;
     }
     for (int i = 0; i < CAPTURE_FB_COUNT; i++) {
-        s_cap.fb[i] = blk + ((size_t)i * s_cap.frame_bytes);
+        s_cap.fb[i] = blk + ((size_t)i * s_cap.fb_alloc_bytes);
     }
     s_cap.ping_fb_idx = 0;
     s_cap.done_fb = NULL;
     s_cap.csi_dma_done_irqs = 0;
     s_cap.csi_get_new_irqs = 0;
-    s_cap.csi_done_sem = xSemaphoreCreateCounting(32, 0);
+    s_cap.csi_done_sem = xSemaphoreCreateCounting(64, 0);
     if (!s_cap.csi_done_sem) {
         vTaskDelete(NULL);
         return NULL;
     }
 
-    ESP_LOGI(CAPTURE_LOG_TAG, "MIPI lane %u Mbps RGB888 DT=0x24", (unsigned)P4KVM_MIPI_LANE_MBPS);
+    ESP_LOGI(CAPTURE_LOG_TAG, "MIPI lane %u Mbps RGB888 DT=0x24 active=%ux%u maxFB=%zu",
+             (unsigned)P4KVM_MIPI_LANE_MBPS, (unsigned)s_cap.hres, (unsigned)s_cap.vres,
+             s_cap.fb_alloc_bytes);
 
+    /* Create CSI at max size so DMA accepts any active frame ≤ max. */
     esp_cam_ctlr_csi_config_t csi_cfg = {
         .ctlr_id = 0,
         .clk_src = MIPI_CSI_PHY_CLK_SRC_DEFAULT,
-        .h_res = s_cap.hres,
-        .v_res = s_cap.vres,
+        .h_res = CAPTURE_MAX_H,
+        .v_res = CAPTURE_MAX_V,
         .data_lane_num = 2,
         .lane_bit_rate_mbps = P4KVM_MIPI_LANE_MBPS,
         .queue_items = CAPTURE_FB_COUNT,
@@ -351,8 +387,8 @@ capture_ctx_t *capture_hw_init_start(void)
         .yuv_std = ISP_YUV_CONV_STD_BT709,
         .has_line_start_packet = false,
         .has_line_end_packet = false,
-        .h_res = s_cap.hres,
-        .v_res = s_cap.vres,
+        .h_res = CAPTURE_MAX_H,
+        .v_res = CAPTURE_MAX_V,
         .bayer_order = COLOR_RAW_ELEMENT_ORDER_BGGR,
         .intr_priority = 0,
         .flags = {.bypass_isp = true, .byte_swap_en = false},
@@ -378,7 +414,7 @@ capture_ctx_t *capture_hw_init_start(void)
     ESP_ERROR_CHECK(esp_cam_ctlr_start(s_cam));
     s_cam_started = true;
     (void)tc358743_set_streaming(s_cap.tc, true);
-    ESP_LOGI(CAPTURE_LOG_TAG, "CSI started %ux%u RGB888 fb=%zu lane=%uMbps DT=0x24",
+    ESP_LOGI(CAPTURE_LOG_TAG, "CSI started active=%ux%u RGB888 frame=%zu lane=%uMbps DT=0x24",
              (unsigned)s_cap.hres, (unsigned)s_cap.vres, s_cap.frame_bytes,
              (unsigned)P4KVM_MIPI_LANE_MBPS);
     return &s_cap;
@@ -388,15 +424,12 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
 {
     ESP_RETURN_ON_FALSE(c && c->tc && s_cam, ESP_ERR_INVALID_ARG, CAPTURE_LOG_TAG, "ctx");
 
-    const bool locked = tc_locked(c->tc);
-
     /*
-     * Recover is only called when the stream is already dead (timeout).
-     * Full CSI reapply (CTXRST) is correct here — TX is idle.
-     * Unlocked: also HPD-cycle the source.
+     * Stream is dead when we get here. Always HPD-cycle — SYS can still read
+     * locked while CSI TX (TxAct) is hung. Then re-detect timing (dynamic res)
+     * and full CSI reapply.
      */
-    ESP_LOGW(CAPTURE_LOG_TAG, "CSI recover (locked=%d): cam stop → CSI reapply → start",
-             (int)locked);
+    ESP_LOGW(CAPTURE_LOG_TAG, "CSI recover: cam stop → HPD → timing → CSI reapply → start");
 
     if (s_cam_started) {
         (void)esp_cam_ctlr_stop(s_cam);
@@ -406,14 +439,17 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     c->ping_fb_idx = 0;
     c->done_fb = NULL;
 
-    if (!locked) {
-        (void)tc358743_hdmi_hotplug_reset(c->tc);
-        wait_hdmi_lock(c->tc, 5000);
-    }
+    (void)tc358743_hdmi_hotplug_reset(c->tc);
+    wait_hdmi_lock(c->tc, 5000);
 
     if (tc_locked(c->tc)) {
+        uint32_t h = 0, v = 0;
+        if (read_hdmi_timing(c->tc, &h, &v)) {
+            (void)apply_active_size(c, h, v);
+        }
         after_hdmi_lock(c->tc);
     } else {
+        ESP_LOGW(CAPTURE_LOG_TAG, "recover: still unlocked after HPD");
         (void)tc358743_set_streaming(c->tc, true);
     }
 
@@ -425,7 +461,8 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     if (er == ESP_OK) {
         s_cam_started = true;
         (void)tc358743_set_streaming(c->tc, true);
-        ESP_LOGI(CAPTURE_LOG_TAG, "CSI recover: cam restarted");
+        ESP_LOGI(CAPTURE_LOG_TAG, "CSI recover: cam restarted %ux%u",
+                 (unsigned)c->hres, (unsigned)c->vres);
     } else {
         ESP_LOGE(CAPTURE_LOG_TAG, "CSI recover: cam start failed %s", esp_err_to_name(er));
     }
