@@ -16,5 +16,9 @@
 #define P4KVM_CSI_H_RES 1920u
 #define P4KVM_CSI_V_RES 1080u
 
-/* 1080p UYVY on 2 lanes. */
-#define P4KVM_MIPI_LANE_MBPS 1200
+/*
+ * CSI lane bit rate must match TC358743 PLL.
+ * 720x480 UYVY ~331 Mbps total ≈ 166 Mbps/lane → 400 Mbps is safe headroom.
+ * Bump to 1200 when the source is true 1080p.
+ */
+#define P4KVM_MIPI_LANE_MBPS 400
