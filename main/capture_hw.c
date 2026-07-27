@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Waveshare ESP32-P4-WIFI6-DEV-KIT Rev 1.1 + Waveshare HDMI to CSI Adapter
- * RGB888 CSI (DT 0x24). CSI controller sized to active HDMI timing.
+ * RGB888 CSI (DT 0x24). Soft recover restarts cam without HPD when locked.
  */
 #include "capture_priv.h"
 
@@ -112,6 +112,7 @@ static bool tc_locked(tc358743_t *tc)
     if (st == 0xffu || st == 0xdfu || st == 0x7fu || st == 0x9fu || st == 0xf7u || st == 0xfdu) {
         return false;
     }
+    /* TMDS + SCDT + SYNC (bits 1, 3, 7). */
     return ((st & 0x02) != 0) && ((st & 0x08) != 0) && ((st & 0x80) != 0);
 }
 
@@ -345,6 +346,45 @@ static esp_err_t recreate_csi_at_size(capture_ctx_t *c, uint32_t hres, uint32_t 
     return ESP_OK;
 }
 
+/** Stop cam → soft_kick bridge → start cam. No HPD. */
+static esp_err_t soft_restart_stream(capture_ctx_t *c)
+{
+    uint32_t done_before = c->csi_dma_done_irqs;
+
+    if (s_cam_started && s_cam) {
+        (void)esp_cam_ctlr_stop(s_cam);
+        s_cam_started = false;
+    }
+    drain_done_sem(c);
+    c->ping_fb_idx = 0;
+    c->done_fb = NULL;
+
+    (void)tc358743_soft_kick(c->tc);
+    ISP.cntl.isp_en = 0;
+    MIPI_CSI_BRIDGE.int_clr.val = 0x3fu;
+    capture_configure_p4_csi_bridge(c->hres, c->vres);
+
+    esp_err_t er = esp_cam_ctlr_start(s_cam);
+    if (er != ESP_OK) {
+        ESP_LOGE(CAPTURE_LOG_TAG, "soft restart cam start failed %s", esp_err_to_name(er));
+        return er;
+    }
+    s_cam_started = true;
+    (void)tc358743_set_streaming(c->tc, true);
+
+    /* Brief wait: if done advances, soft worked. */
+    vTaskDelay(pdMS_TO_TICKS(200));
+    if (c->csi_dma_done_irqs > done_before) {
+        s_soft_fail_streak = 0;
+        ESP_LOGI(CAPTURE_LOG_TAG, "soft restart OK done %" PRIu32 "→%" PRIu32, done_before,
+                 c->csi_dma_done_irqs);
+        return ESP_OK;
+    }
+    s_soft_fail_streak++;
+    ESP_LOGW(CAPTURE_LOG_TAG, "soft restart no new frames (streak=%d)", s_soft_fail_streak);
+    return ESP_ERR_TIMEOUT;
+}
+
 capture_ctx_t *capture_hw_init_start(void)
 {
     esp_ldo_channel_handle_t ldo = NULL;
@@ -490,19 +530,13 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
 {
     ESP_RETURN_ON_FALSE(c && c->tc, ESP_ERR_INVALID_ARG, CAPTURE_LOG_TAG, "ctx");
 
-    /* Prefer soft kick while HDMI is still locked — HPD was killing the stream. */
-    if (tc_locked(c->tc) && s_soft_fail_streak < 3) {
-        ESP_LOGW(CAPTURE_LOG_TAG, "CSI soft recover (locked, no HPD) streak=%d", s_soft_fail_streak);
-        (void)tc358743_soft_kick(c->tc);
-        MIPI_CSI_BRIDGE.int_clr.val = 0x3fu;
-        capture_configure_p4_csi_bridge(c->hres, c->vres);
-        if (!s_cam_started && s_cam) {
-            if (esp_cam_ctlr_start(s_cam) == ESP_OK) {
-                s_cam_started = true;
-            }
+    /* Soft path while HDMI locked: cam stop/start + bridge kick, no HPD. */
+    if (tc_locked(c->tc) && s_soft_fail_streak < 4) {
+        ESP_LOGW(CAPTURE_LOG_TAG, "CSI soft recover (locked) streak=%d", s_soft_fail_streak);
+        if (soft_restart_stream(c) == ESP_OK) {
+            return ESP_OK;
         }
-        s_soft_fail_streak++;
-        return ESP_OK;
+        /* fall through to hard if soft did not produce frames */
     }
 
     s_soft_fail_streak = 0;
