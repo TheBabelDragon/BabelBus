@@ -1,6 +1,8 @@
 /*
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
+ *
+ * TC358743 path matched to jrowny/p4kvm (working): non-continuous MIPI clock.
  */
 #include "tc358743.h"
 
@@ -82,7 +84,6 @@ static const char *TAG = "tc358743";
 #define MASK_D3M_HSTXVREGEN 0x0010
 
 #define TXOPTIONCNTRL 0x0238
-#define MASK_CONTCLKMODE 0x00000001
 
 #define CSI_START 0x0518
 #define MASK_STRT 0x00000001
@@ -360,12 +361,7 @@ static void sleep_mode(tc358743_t *d, bool enable)
     wr16_and_or(d, SYSCTL, (uint16_t)~MASK_SLEEP, enable ? MASK_SLEEP : 0);
 }
 
-static void csi_force_lp11_to_hs(tc358743_t *d)
-{
-    wr32(d, TXOPTIONCNTRL, 0);
-    wr32(d, TXOPTIONCNTRL, MASK_CONTCLKMODE);
-}
-
+/* p4kvm / Linux: non-continuous clock only. No CONTCLK force. */
 static void enable_stream(tc358743_t *d, bool enable)
 {
     if (enable) {
@@ -375,10 +371,6 @@ static void enable_stream(tc358743_t *d, bool enable)
     }
     wr16_and_or(d, CONFCTL, (uint16_t) ~(MASK_VBUFEN | MASK_ABUFEN),
                 enable ? (MASK_VBUFEN | MASK_ABUFEN) : 0);
-    if (enable) {
-        csi_force_lp11_to_hs(d);
-        wr32(d, CSI_START, MASK_STRT);
-    }
 }
 
 static void set_ref_clk(tc358743_t *d)
@@ -573,10 +565,10 @@ static void set_csi_lanes(tc358743_t *d, unsigned lanes)
          ((lanes > 0) ? MASK_CLM_HSTXVREGEN : 0) | ((lanes > 0) ? MASK_D0M_HSTXVREGEN : 0) |
              ((lanes > 1) ? MASK_D1M_HSTXVREGEN : 0) | ((lanes > 2) ? MASK_D2M_HSTXVREGEN : 0) |
              ((lanes > 3) ? MASK_D3M_HSTXVREGEN : 0));
+    /* Linux / p4kvm: non-continuous clock. */
     wr32(d, TXOPTIONCNTRL, 0);
     wr32(d, STARTCNTRL, MASK_START);
     wr32(d, CSI_START, MASK_STRT);
-    wr32(d, TXOPTIONCNTRL, MASK_CONTCLKMODE);
     uint32_t nol = (lanes == 4) ? MASK_NOL_4 : (lanes == 3) ? MASK_NOL_3 : (lanes == 2) ? MASK_NOL_2 : MASK_NOL_1;
     wr32(d, CSI_CONFW, MASK_MODE_SET | MASK_ADDRESS_CSI_CONTROL | MASK_CSI_MODE | MASK_TXHSMD | nol);
     wr32(d, CSI_CONFW, MASK_MODE_SET | MASK_ADDRESS_CSI_ERR_INTENA | MASK_TXBRK | MASK_QUNK | MASK_WCER | MASK_INER);
@@ -598,18 +590,7 @@ static void edid_write_builtin(tc358743_t *d)
         i2c_write_reg(d, EDID_RAM + i, tc358743_edid_bin + i, 128);
     }
     vTaskDelay(pdMS_TO_TICKS(10));
-    ESP_LOGI(TAG, "EDID loaded (%u bytes) — presenting as 1080p monitor", (unsigned)edid_len);
-}
-
-static void present_as_monitor(tc358743_t *d)
-{
-    enable_stream(d, true);
-    vTaskDelay(pdMS_TO_TICKS(50));
-    hpd_set(d, true);
-    ESP_LOGI(TAG, "HPD asserted — source should see a 1080p monitor and start TMDS");
-    vTaskDelay(pdMS_TO_TICKS(200));
-    wr32(d, CSI_START, MASK_STRT);
-    csi_force_lp11_to_hs(d);
+    ESP_LOGI(TAG, "EDID loaded (%u bytes)", (unsigned)edid_len);
 }
 
 esp_err_t tc358743_probe(i2c_master_bus_handle_t bus, const tc358743_cfg_t *cfg, tc358743_t **out_dev)
@@ -664,7 +645,7 @@ esp_err_t tc358743_init_streaming(tc358743_t *d)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
     hpd_set(d, false);
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(20));
     initial_setup(d);
     edid_write_builtin(d);
     uint16_t id = 0;
@@ -684,7 +665,13 @@ esp_err_t tc358743_init_streaming(tc358743_t *d)
 esp_err_t tc358743_enable_hdmi_output(tc358743_t *d)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
-    present_as_monitor(d);
+    /* p4kvm order: VBUFEN on → delay → HPD → CSI_START */
+    enable_stream(d, true);
+    vTaskDelay(pdMS_TO_TICKS(150));
+    hpd_set(d, true);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    wr32(d, CSI_START, MASK_STRT);
+    ESP_LOGI(TAG, "HPD asserted, CSI_START, non-cont clock");
     tc358743_debug_status(d);
     return ESP_OK;
 }
@@ -692,10 +679,10 @@ esp_err_t tc358743_enable_hdmi_output(tc358743_t *d)
 esp_err_t tc358743_hdmi_hotplug_reset(tc358743_t *d)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
-    ESP_LOGI(TAG, "HDMI hotplug reset (unplug → plug as 1080p monitor)");
+    ESP_LOGI(TAG, "HDMI hotplug reset");
     enable_stream(d, false);
     hpd_set(d, false);
-    vTaskDelay(pdMS_TO_TICKS(300));
+    vTaskDelay(pdMS_TO_TICKS(150));
     return tc358743_enable_hdmi_output(d);
 }
 
@@ -705,7 +692,7 @@ esp_err_t tc358743_reapply_csi_path_after_hdmi(tc358743_t *d)
     apply_csi_color_space(d);
     set_csi_lanes(d, d->cfg.lanes);
     wr32(d, CSI_START, MASK_STRT);
-    csi_force_lp11_to_hs(d);
+    enable_stream(d, true);
     return ESP_OK;
 }
 
@@ -727,14 +714,14 @@ esp_err_t tc358743_get_avi_color_format(tc358743_t *d, uint8_t *out_y)
     return ESP_OK;
 }
 
-/* tc358743_debug_bridge / tc358743_debug_stall_extras → tc358743_csi_diag.c */
-
 esp_err_t tc358743_set_streaming(tc358743_t *d, bool on)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
     enable_stream(d, on);
     if (!on) {
         set_csi_lanes(d, d->cfg.lanes);
+    } else {
+        wr32(d, CSI_START, MASK_STRT);
     }
     return ESP_OK;
 }
