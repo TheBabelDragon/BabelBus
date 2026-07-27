@@ -84,6 +84,9 @@ esp_err_t tc358743_get_avi_color_format(tc358743_t *dev, uint8_t *out_y);
 
 void tc358743_cfg_defaults_waveshare_pi(tc358743_cfg_t *c);
 
+/** Low-level 8-bit register read (used by timing helpers). */
+uint8_t tc358743_rd8(tc358743_t *dev, uint16_t reg);
+
 #ifdef __cplusplus
 }
 #endif
