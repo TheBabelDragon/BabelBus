@@ -63,7 +63,8 @@ void capture_mjpeg_run(capture_ctx_t *c)
 
     while (1) {
         if (xSemaphoreTake(c->csi_done_sem, pdMS_TO_TICKS(2000)) != pdTRUE) {
-            ESP_LOGW(CAPTURE_LOG_TAG, "csi frame wait timeout (dma_done_irqs=%lu)", (unsigned long)c->csi_dma_done_irqs);
+            ESP_LOGW(CAPTURE_LOG_TAG, "csi frame wait timeout (dma_done_irqs=%lu)",
+                     (unsigned long)c->csi_dma_done_irqs);
             capture_debug_csi_timeout(c, bpp, c->frame_bytes);
             int64_t now = (int64_t)esp_timer_get_time();
             if (now >= hdmi_recover_cooldown_until_us) {
@@ -88,11 +89,11 @@ void capture_mjpeg_run(capture_ctx_t *c)
         } else if (q > 100u) {
             q = 100u;
         }
-        /* Packed UYVY from CSI; keep subsample YUV422 (documented-safe with YUV422 input). */
+        /* RGB888 from CSI (p4kvm path). */
         jpeg_encode_cfg_t enc = {.width = c->hres,
                                  .height = c->vres,
-                                 .src_type = JPEG_ENCODE_IN_FORMAT_YUV422,
-                                 .sub_sample = JPEG_DOWN_SAMPLING_YUV422,
+                                 .src_type = JPEG_ENCODE_IN_FORMAT_RGB888,
+                                 .sub_sample = JPEG_DOWN_SAMPLING_YUV420,
                                  .image_quality = q};
         const uint32_t jpeg_in_bytes = (uint32_t)c->frame_bytes;
         uint32_t out_sz = 0;

@@ -4,16 +4,7 @@
  *
  * Waveshare ESP32-P4-WIFI6-DEV-KIT Rev 1.1 + Waveshare HDMI to CSI Adapter
  *
- * Confirmed wiring:
- *   CSI FPC  → MIPI-CSI (I2C SDA=GPIO7 SCL=GPIO8 + data + 3V3)
- *   RESET    → GPIO 23
- *   I2S SCK  → GPIO 20
- *   I2S WFS  → GPIO 21
- *   I2S SD   → GPIO 22
- *   GND      → GND
- *
- * I2C: board has external pull-ups — do NOT enable internal ones
- * (Waveshare wiki / example: enable_internal_pullup = false).
+ * Path aligned with jrowny/p4kvm: RGB888 CSI (datatype 0x24), not UYVY.
  */
 #include "capture_priv.h"
 
@@ -52,6 +43,8 @@
 static esp_cam_ctlr_handle_t s_cam;
 static isp_proc_handle_t s_isp_bypass;
 static bool s_cam_started;
+/* CSI-2 RGB888 user data type — same as p4kvm. */
+static const uint32_t s_csi_expected_dt = 0x24u;
 static capture_ctx_t s_cap;
 
 static void tc358743_resetn_pulse(void)
@@ -169,17 +162,28 @@ static void after_hdmi_lock(tc358743_t *tc)
         ESP_LOGI(CAPTURE_LOG_TAG, "HDMI timing HAct=%u VAct=%u",
                  (unsigned)hact, (unsigned)vact);
     }
-    tc358743_set_csi_uyvy422(tc, true);
+    /* RGB888 path — do NOT force UYVY. */
+    tc358743_set_csi_uyvy422(tc, false);
     (void)tc358743_reapply_csi_path_after_hdmi(tc);
     (void)tc358743_set_streaming(tc, true);
-    ESP_LOGI(CAPTURE_LOG_TAG, "CSI path reapplied after HDMI lock");
+    ESP_LOGI(CAPTURE_LOG_TAG, "CSI path reapplied after HDMI lock (RGB888)");
 }
 
 void capture_debug_csi_timeout(capture_ctx_t *c, unsigned bpp, size_t fb_bytes)
 {
-    (void)bpp;
-    ESP_LOGW(CAPTURE_LOG_TAG, "CSI stall done=%" PRIu32 " get_new=%" PRIu32 " fb=%zu",
-             c->csi_dma_done_irqs, c->csi_get_new_irqs, fb_bytes);
+    ESP_LOGW(CAPTURE_LOG_TAG, "CSI stall done=%" PRIu32 " get_new=%" PRIu32 " fb=%zu bpp=%u",
+             c->csi_dma_done_irqs, c->csi_get_new_irqs, fb_bytes, bpp);
+    {
+        uint32_t brg_fc = MIPI_CSI_BRIDGE.frame_cfg.val;
+        uint32_t dtc = MIPI_CSI_BRIDGE.data_type_cfg.val;
+        uint32_t ir = MIPI_CSI_BRIDGE.int_raw.val;
+        uint32_t ist = MIPI_CSI_BRIDGE.int_st.val;
+        ESP_LOGW(CAPTURE_LOG_TAG,
+                 "  BRG frame=0x%08" PRIx32 " hadr=%" PRIu32 " vadr=%" PRIu32
+                 " DT min=0x%02x max=0x%02x int_raw=0x%08" PRIx32 " int_st=0x%08" PRIx32,
+                 brg_fc, (brg_fc >> 12) & 0xfffu, brg_fc & 0xfffu,
+                 (unsigned)(dtc & 0x3fu), (unsigned)((dtc >> 8) & 0x3fu), ir, ist);
+    }
     if (c && c->tc) {
         tc358743_debug_status(c->tc);
         tc358743_log_link_state(c->tc);
@@ -193,15 +197,15 @@ void capture_debug_csi_timeout(capture_ctx_t *c, unsigned bpp, size_t fb_bytes)
 
 unsigned capture_csi_bpp(void)
 {
-    return 16u;
+    return 24u;
 }
 
 void capture_fill_esp_cam_color_types(esp_cam_ctlr_csi_config_t *csi, esp_isp_processor_cfg_t *isp)
 {
-    csi->input_data_color_type = CAM_CTLR_COLOR_YUV422_UYVY;
-    csi->output_data_color_type = CAM_CTLR_COLOR_YUV422_UYVY;
-    isp->input_data_color_type = ISP_COLOR_YUV422;
-    isp->output_data_color_type = ISP_COLOR_YUV422;
+    csi->input_data_color_type = CAM_CTLR_COLOR_RGB888;
+    csi->output_data_color_type = CAM_CTLR_COLOR_RGB888;
+    isp->input_data_color_type = ISP_COLOR_RGB888;
+    isp->output_data_color_type = ISP_COLOR_RGB888;
 }
 
 static void capture_configure_p4_csi_bridge(uint32_t hres, uint32_t vres)
@@ -210,9 +214,8 @@ static void capture_configure_p4_csi_bridge(uint32_t hres, uint32_t vres)
     MIPI_CSI_BRIDGE.frame_cfg.vadr_num = vres;
     MIPI_CSI_BRIDGE.frame_cfg.has_hsync_e = 0u;
     MIPI_CSI_BRIDGE.frame_cfg.vadr_num_check = 0u;
-    /* Accept any CSI data type — wrong filter was a silent black-hole. */
-    MIPI_CSI_BRIDGE.data_type_cfg.data_type_min = 0x00u;
-    MIPI_CSI_BRIDGE.data_type_cfg.data_type_max = 0x3Fu;
+    MIPI_CSI_BRIDGE.data_type_cfg.data_type_min = s_csi_expected_dt;
+    MIPI_CSI_BRIDGE.data_type_cfg.data_type_max = s_csi_expected_dt;
     MIPI_CSI_BRIDGE.int_clr.val = 0x3fu;
 }
 
@@ -278,7 +281,7 @@ capture_ctx_t *capture_hw_init_start(void)
 
     ESP_ERROR_CHECK(tc358743_probe(i2c_bus, NULL, &s_cap.tc));
     ESP_ERROR_CHECK(tc358743_init_streaming(s_cap.tc));
-    tc358743_set_csi_uyvy422(s_cap.tc, true);
+    /* Default CSI color is RGB888 (csi_uyvy422=false in init). */
     tc358743_log_link_state(s_cap.tc);
 
     {
@@ -304,14 +307,15 @@ capture_ctx_t *capture_hw_init_start(void)
     }
 
     resolve_capture_size(s_cap.tc, &s_cap.hres, &s_cap.vres);
-    s_cap.frame_bytes = (size_t)s_cap.hres * (size_t)s_cap.vres * 2u;
+    /* RGB888 = 3 bytes/pixel */
+    s_cap.frame_bytes = (size_t)s_cap.hres * (size_t)s_cap.vres * 3u;
 
     size_t align = 0;
     ESP_ERROR_CHECK(esp_cache_get_alignment(MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA, &align));
     uint8_t *blk = heap_caps_aligned_calloc(align, CAPTURE_FB_COUNT, s_cap.frame_bytes,
                                             MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!blk) {
-        ESP_LOGE(CAPTURE_LOG_TAG, "FB alloc fail (%ux%u)", (unsigned)s_cap.hres, (unsigned)s_cap.vres);
+        ESP_LOGE(CAPTURE_LOG_TAG, "FB alloc fail (%ux%u RGB888)", (unsigned)s_cap.hres, (unsigned)s_cap.vres);
         vTaskDelete(NULL);
         return NULL;
     }
@@ -328,8 +332,7 @@ capture_ctx_t *capture_hw_init_start(void)
         return NULL;
     }
 
-    ESP_LOGI(CAPTURE_LOG_TAG, "MIPI lane rate %u Mbps (must match TC358743 PLL)",
-             (unsigned)P4KVM_MIPI_LANE_MBPS);
+    ESP_LOGI(CAPTURE_LOG_TAG, "MIPI lane %u Mbps RGB888 DT=0x24", (unsigned)P4KVM_MIPI_LANE_MBPS);
 
     esp_cam_ctlr_csi_config_t csi_cfg = {
         .ctlr_id = 0,
@@ -340,7 +343,7 @@ capture_ctx_t *capture_hw_init_start(void)
         .lane_bit_rate_mbps = P4KVM_MIPI_LANE_MBPS,
         .queue_items = CAPTURE_FB_COUNT,
         .byte_swap_en = false,
-        .bk_buffer_dis = false,
+        .bk_buffer_dis = true,
     };
     esp_isp_processor_cfg_t isp_cfg = {
         .clk_src = ISP_CLK_SRC_DEFAULT,
@@ -369,14 +372,15 @@ capture_ctx_t *capture_hw_init_start(void)
     ISP.cntl.isp_en = 0;
     capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
 
-    tc358743_set_csi_uyvy422(s_cap.tc, true);
+    tc358743_set_csi_uyvy422(s_cap.tc, false);
     (void)tc358743_reapply_csi_path_after_hdmi(s_cap.tc);
     (void)tc358743_set_streaming(s_cap.tc, true);
 
+    capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
     ESP_ERROR_CHECK(esp_cam_ctlr_start(s_cam));
     s_cam_started = true;
     (void)tc358743_set_streaming(s_cap.tc, true);
-    ESP_LOGI(CAPTURE_LOG_TAG, "CSI started %ux%u UYVY fb=%zu lane=%uMbps",
+    ESP_LOGI(CAPTURE_LOG_TAG, "CSI started %ux%u RGB888 fb=%zu lane=%uMbps DT=0x24",
              (unsigned)s_cap.hres, (unsigned)s_cap.vres, s_cap.frame_bytes,
              (unsigned)P4KVM_MIPI_LANE_MBPS);
     return &s_cap;
@@ -392,6 +396,7 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
         ESP_LOGW(CAPTURE_LOG_TAG, "CSI soft recover (stream re-assert only, no CTXRST)");
         capture_configure_p4_csi_bridge(c->hres, c->vres);
         ISP.cntl.isp_en = 0;
+        tc358743_set_csi_uyvy422(c->tc, false);
         (void)tc358743_set_streaming(c->tc, true);
         return ESP_OK;
     }
