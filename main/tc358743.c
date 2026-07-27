@@ -360,7 +360,6 @@ static void sleep_mode(tc358743_t *d, bool enable)
     wr16_and_or(d, SYSCTL, (uint16_t)~MASK_SLEEP, enable ? MASK_SLEEP : 0);
 }
 
-/** Linux tc358743: non-cont first (LP11), then continuous to force LP11	o HS. */
 static void csi_force_lp11_to_hs(tc358743_t *d)
 {
     wr32(d, TXOPTIONCNTRL, 0);
@@ -388,24 +387,18 @@ static void set_ref_clk(tc358743_t *d)
     uint32_t sys_freq = pdata->refclk_hz / 10000;
     wr8(d, SYS_FREQ0, sys_freq & 0x00ff);
     wr8(d, SYS_FREQ1, (sys_freq & 0xff00) >> 8);
-
     wr8_and_or(d, PHY_CTL0, (uint8_t)~MASK_PHY_SYSCLK_IND, (pdata->refclk_hz == 42000000) ? MASK_PHY_SYSCLK_IND : 0);
-
     uint16_t fh_min = pdata->refclk_hz / 100000;
     wr8(d, FH_MIN0, fh_min & 0x00ff);
     wr8(d, FH_MIN1, (fh_min & 0xff00) >> 8);
-
     uint16_t fh_max = (uint16_t)((fh_min * 66) / 10);
     wr8(d, FH_MAX0, fh_max & 0x00ff);
     wr8(d, FH_MAX1, (fh_max & 0xff00) >> 8);
-
     uint32_t lockdet_ref = pdata->refclk_hz / 100;
     wr8(d, LOCKDET_REF0, lockdet_ref & 0x0000ff);
     wr8(d, LOCKDET_REF1, (lockdet_ref & 0x00ff00) >> 8);
     wr8(d, LOCKDET_REF2, (lockdet_ref & 0x0f0000) >> 16);
-
     wr8_and_or(d, NCO_F0_MOD, (uint8_t)~MASK_NCO_F0_MOD, (pdata->refclk_hz == 27000000) ? MASK_NCO_F0_MOD_27MHZ : 0);
-
     uint32_t cec_freq = (656u * sys_freq) / 4200u;
     wr16(d, 0x0028, (uint16_t)cec_freq);
     wr16(d, 0x002a, (uint16_t)cec_freq);
@@ -418,7 +411,6 @@ static void set_pll(tc358743_t *d)
     uint16_t pllctl1 = rd16(d, PLLCTL1);
     uint16_t pllctl0_new = SET_PLL_PRD(pdata->pll_prd) | SET_PLL_FBD(pdata->pll_fbd);
     uint32_t hsck = (pdata->refclk_hz / pdata->pll_prd) * pdata->pll_fbd;
-
     if ((pllctl0 != pllctl0_new) || ((pllctl1 & MASK_PLL_EN) == 0)) {
         uint16_t pll_frs;
         if (hsck > 500000000) {
@@ -430,7 +422,6 @@ static void set_pll(tc358743_t *d)
         } else {
             pll_frs = 0x3;
         }
-
         sleep_mode(d, true);
         wr16(d, PLLCTL0, pllctl0_new);
         wr16_and_or(d, PLLCTL1, (uint16_t) ~(MASK_PLL_FRS | MASK_RESETB | MASK_PLL_EN),
@@ -452,7 +443,6 @@ static void set_hdmi_hdcp(tc358743_t *d, bool enable)
 static void set_hdmi_phy(tc358743_t *d)
 {
     tc358743_cfg_t *pdata = &d->cfg;
-
     wr8_and_or(d, PHY_EN, (uint8_t)~MASK_ENABLE_PHY, 0);
     wr8(d, PHY_CTL1, SET_PHY_AUTO_RST1_US(1600) | SET_FREQ_RANGE_MODE_CYCLES(1));
     wr8_and_or(d, PHY_CTL2, (uint8_t)~MASK_PHY_AUTO_RSTn,
@@ -471,7 +461,6 @@ static void set_hdmi_phy(tc358743_t *d)
 
 static void set_hdmi_audio(tc358743_t *d)
 {
-    (void)d;
     wr8(d, FORCE_MUTE, 0x00);
     wr8(d, AUTO_CMD0,
         MASK_AUTO_MUTE7 | MASK_AUTO_MUTE6 | MASK_AUTO_MUTE5 | MASK_AUTO_MUTE4 | MASK_AUTO_MUTE1 | MASK_AUTO_MUTE0);
@@ -503,21 +492,17 @@ static void set_hdmi_info_frame(tc358743_t *d)
 static void initial_setup(tc358743_t *d)
 {
     tc358743_cfg_t *pdata = &d->cfg;
-
     wr16_and_or(d, SYSCTL, (uint16_t) ~(MASK_IRRST | MASK_CECRST), MASK_IRRST | MASK_CECRST);
     reset_blocks(d, MASK_CTXRST | MASK_HDMIRST);
     sleep_mode(d, false);
-
     wr16(d, FIFOCTL, pdata->fifo_level);
     set_ref_clk(d);
     wr8_and_or(d, DDC_CTL, (uint8_t)~MASK_DDC5V_MODE, pdata->ddc5v_mode & MASK_DDC5V_MODE);
     wr8_and_or(d, EDID_MODE, (uint8_t)~MASK_EDID_MODE, MASK_EDID_MODE_E_DDC);
-
     set_hdmi_phy(d);
     set_hdmi_hdcp(d, pdata->enable_hdcp);
     set_hdmi_audio(d);
     set_hdmi_info_frame(d);
-
     wr8_and_or(d, VI_MODE, (uint8_t)~MASK_RGB_DVI, 0);
     wr8_and_or(d, VOUT_SET2, (uint8_t)~MASK_VOUTCOLORMODE, MASK_VOUTCOLORMODE_AUTO);
     wr8(d, VOUT_SET3, MASK_VOUT_EXTCNT);
@@ -559,9 +544,7 @@ void tc358743_set_csi_uyvy422(tc358743_t *d, bool uyvy422)
 static void set_csi_lanes(tc358743_t *d, unsigned lanes)
 {
     tc358743_cfg_t *pdata = &d->cfg;
-
     reset_blocks(d, MASK_CTXRST);
-
     if (lanes < 1) {
         wr32(d, CLW_CNTRL, MASK_CLW_LANEDISABLE);
     }
@@ -577,7 +560,6 @@ static void set_csi_lanes(tc358743_t *d, unsigned lanes)
     if (lanes < 4) {
         wr32(d, D3W_CNTRL, MASK_D3W_LANEDISABLE);
     }
-
     wr32(d, LINEINITCNT, pdata->lineinitcnt);
     wr32(d, LPTXTIMECNT, pdata->lptxtimecnt);
     wr32(d, TCLK_HEADERCNT, pdata->tclk_headercnt);
@@ -587,20 +569,15 @@ static void set_csi_lanes(tc358743_t *d, unsigned lanes)
     wr32(d, TCLK_POSTCNT, pdata->tclk_postcnt);
     wr32(d, THS_TRAILCNT, pdata->ths_trailcnt);
     wr32(d, HSTXVREGCNT, pdata->hstxvregcnt);
-
     wr32(d, HSTXVREGEN,
          ((lanes > 0) ? MASK_CLM_HSTXVREGEN : 0) | ((lanes > 0) ? MASK_D0M_HSTXVREGEN : 0) |
              ((lanes > 1) ? MASK_D1M_HSTXVREGEN : 0) | ((lanes > 2) ? MASK_D2M_HSTXVREGEN : 0) |
              ((lanes > 3) ? MASK_D3M_HSTXVREGEN : 0));
-
     wr32(d, TXOPTIONCNTRL, 0);
     wr32(d, STARTCNTRL, MASK_START);
     wr32(d, CSI_START, MASK_STRT);
-    /* Kick continuous clock after PPI start (Linux stream-on path). */
     wr32(d, TXOPTIONCNTRL, MASK_CONTCLKMODE);
-
     uint32_t nol = (lanes == 4) ? MASK_NOL_4 : (lanes == 3) ? MASK_NOL_3 : (lanes == 2) ? MASK_NOL_2 : MASK_NOL_1;
-
     wr32(d, CSI_CONFW, MASK_MODE_SET | MASK_ADDRESS_CSI_CONTROL | MASK_CSI_MODE | MASK_TXHSMD | nol);
     wr32(d, CSI_CONFW, MASK_MODE_SET | MASK_ADDRESS_CSI_ERR_INTENA | MASK_TXBRK | MASK_QUNK | MASK_WCER | MASK_INER);
     wr32(d, CSI_CONFW, MASK_MODE_CLEAR | MASK_ADDRESS_CSI_ERR_HALT | MASK_TXBRK | MASK_QUNK);
@@ -645,7 +622,6 @@ esp_err_t tc358743_probe(i2c_master_bus_handle_t bus, const tc358743_cfg_t *cfg,
     } else {
         tc358743_cfg_defaults_waveshare_pi(&d->cfg);
     }
-
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = TC358743_I2C_ADDR,
@@ -687,26 +663,20 @@ esp_err_t tc358743_sys_status(tc358743_t *d, uint8_t *out_st)
 esp_err_t tc358743_init_streaming(tc358743_t *d)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
-
     hpd_set(d, false);
     vTaskDelay(pdMS_TO_TICKS(50));
-
     initial_setup(d);
     edid_write_builtin(d);
-
     uint16_t id = 0;
     tc358743_read_chip_id(d, &id);
     ESP_LOGI(TAG, "CHIPID 0x%04x", id);
-
     enable_stream(d, false);
     set_pll(d);
     set_csi_lanes(d, d->cfg.lanes);
     d->csi_uyvy422 = false;
     apply_csi_color_space(d);
-
     wr16(d, INTSTATUS, 0xffff);
     wr16(d, INTMASK, (uint16_t)(~(MASK_HDMI_MSK | MASK_CSI_MSK) & 0xffff));
-
     tc358743_debug_status(d);
     return ESP_OK;
 }
@@ -757,15 +727,7 @@ esp_err_t tc358743_get_avi_color_format(tc358743_t *d, uint8_t *out_y)
     return ESP_OK;
 }
 
-void tc358743_debug_stall_extras(tc358743_t *d)
-{
-    (void)d;
-}
-
-void tc358743_debug_bridge(tc358743_t *d)
-{
-    (void)d;
-}
+/* tc358743_debug_bridge / tc358743_debug_stall_extras → tc358743_csi_diag.c */
 
 esp_err_t tc358743_set_streaming(tc358743_t *d, bool on)
 {
