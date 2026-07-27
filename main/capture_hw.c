@@ -144,14 +144,34 @@ static void wait_hdmi_lock(tc358743_t *tc, uint32_t timeout_ms)
     tc358743_log_link_state(tc);
 }
 
+/** Prefer measured HDMI active size; fall back to compiled default. */
+static void resolve_capture_size(tc358743_t *tc, uint32_t *hres, uint32_t *vres)
+{
+    uint16_t hact = 0, vact = 0;
+    if (tc && tc358743_get_detected_timing(tc, &hact, &vact) == ESP_OK &&
+        hact >= 320u && vact >= 240u && hact <= 1920u && vact <= 1080u) {
+        /* UYVY needs even width */
+        if (hact & 1u) {
+            hact--;
+        }
+        *hres = hact;
+        *vres = vact;
+        ESP_LOGI(CAPTURE_LOG_TAG, "CSI sized to HDMI timing %ux%u", (unsigned)*hres, (unsigned)*vres);
+    } else {
+        *hres = P4KVM_CSI_H_RES;
+        *vres = P4KVM_CSI_V_RES;
+        ESP_LOGW(CAPTURE_LOG_TAG, "CSI sized to default %ux%u (no valid HDMI timing)",
+                 (unsigned)*hres, (unsigned)*vres);
+    }
+}
+
 /** After TMDS lock: reprogram CSI TX on the bridge and log measured timing. */
 static void after_hdmi_lock(tc358743_t *tc)
 {
     uint16_t hact = 0, vact = 0;
     if (tc358743_get_detected_timing(tc, &hact, &vact) == ESP_OK) {
-        ESP_LOGI(CAPTURE_LOG_TAG, "HDMI timing HAct=%u VAct=%u (CSI expects %ux%u)",
-                 (unsigned)hact, (unsigned)vact,
-                 (unsigned)P4KVM_CSI_H_RES, (unsigned)P4KVM_CSI_V_RES);
+        ESP_LOGI(CAPTURE_LOG_TAG, "HDMI timing HAct=%u VAct=%u",
+                 (unsigned)hact, (unsigned)vact);
     }
     tc358743_set_csi_uyvy422(tc, true);
     (void)tc358743_reapply_csi_path_after_hdmi(tc);
@@ -168,7 +188,8 @@ void capture_debug_csi_timeout(capture_ctx_t *c, unsigned bpp, size_t fb_bytes)
         tc358743_log_link_state(c->tc);
         uint16_t hact = 0, vact = 0;
         if (tc358743_get_detected_timing(c->tc, &hact, &vact) == ESP_OK) {
-            ESP_LOGW(CAPTURE_LOG_TAG, "stall timing HAct=%u VAct=%u", (unsigned)hact, (unsigned)vact);
+            ESP_LOGW(CAPTURE_LOG_TAG, "stall timing HAct=%u VAct=%u (CSI %ux%u)",
+                     (unsigned)hact, (unsigned)vact, (unsigned)c->hres, (unsigned)c->vres);
         }
     }
 }
@@ -284,8 +305,8 @@ capture_ctx_t *capture_hw_init_start(void)
         after_hdmi_lock(s_cap.tc);
     }
 
-    s_cap.hres = P4KVM_CSI_H_RES;
-    s_cap.vres = P4KVM_CSI_V_RES;
+    /* Size CSI to whatever the source is actually sending (e.g. 720x480). */
+    resolve_capture_size(s_cap.tc, &s_cap.hres, &s_cap.vres);
     s_cap.frame_bytes = (size_t)s_cap.hres * (size_t)s_cap.vres * 2u;
 
     size_t align = 0;
@@ -293,7 +314,7 @@ capture_ctx_t *capture_hw_init_start(void)
     uint8_t *blk = heap_caps_aligned_calloc(align, CAPTURE_FB_COUNT, s_cap.frame_bytes,
                                             MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!blk) {
-        ESP_LOGE(CAPTURE_LOG_TAG, "FB alloc fail");
+        ESP_LOGE(CAPTURE_LOG_TAG, "FB alloc fail (%ux%u)", (unsigned)s_cap.hres, (unsigned)s_cap.vres);
         vTaskDelete(NULL);
         return NULL;
     }
@@ -354,7 +375,8 @@ capture_ctx_t *capture_hw_init_start(void)
 
     ESP_ERROR_CHECK(esp_cam_ctlr_start(s_cam));
     s_cam_started = true;
-    ESP_LOGI(CAPTURE_LOG_TAG, "CSI started");
+    ESP_LOGI(CAPTURE_LOG_TAG, "CSI started %ux%u UYVY fb=%zu", (unsigned)s_cap.hres,
+             (unsigned)s_cap.vres, s_cap.frame_bytes);
     return &s_cap;
 }
 
@@ -370,6 +392,7 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     if (tc_locked(c->tc)) {
         after_hdmi_lock(c->tc);
     }
+    /* Cam was created at init size; only retune bridge geometry if it still matches. */
     capture_configure_p4_csi_bridge(c->hres, c->vres);
     ISP.cntl.isp_en = 0;
     c->ping_fb_idx = 0;
