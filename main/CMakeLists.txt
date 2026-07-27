@@ -10,6 +10,7 @@ set(babelbus_srcs
     "main.c"
     "tc358743.c"
     "tc358743_bus.c"
+    "tc358743_csi_diag.c"
 )
 
 idf_component_register(
