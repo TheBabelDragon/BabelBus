@@ -70,20 +70,13 @@ static void tc358743_resetn_pulse(void)
 #endif
 }
 
-static bool tc_status_is_garbage(uint8_t st)
-{
-    return tc358743_byte_is_bus_garbage(st);
-}
-
 static bool tc_has_pixel_stream(tc358743_t *tc)
 {
     uint8_t st = 0;
     if (tc358743_sys_status(tc, &st) != ESP_OK) {
         return false;
     }
-    if (tc_status_is_garbage(st)) {
-        return false;
-    }
+    /* TMDS + SYNC. Do not reject 0xDF-style patterns as "garbage". */
     return ((st & 0x02) != 0) && ((st & 0x80) != 0);
 }
 
@@ -96,13 +89,7 @@ static void wait_tc358743_pixel_stream(tc358743_t *tc, uint32_t timeout_ms)
     while (waited < timeout_ms) {
         uint8_t st = 0;
         (void)tc358743_sys_status(tc, &st);
-        if (tc_status_is_garbage(st)) {
-            if ((waited % 1000u) == 0u) {
-                ESP_LOGE(CAPTURE_LOG_TAG,
-                         "SYS_STATUS=0x%02x is I2C garbage — not HDMI; reseat CSI ribbon / check RESETN",
-                         st);
-            }
-        } else if (tc_has_pixel_stream(tc)) {
+        if (tc_has_pixel_stream(tc)) {
             ESP_LOGI(CAPTURE_LOG_TAG, "HDMI ready SYS_STATUS=0x%02x after %" PRIu32 " ms", st, waited);
             tc358743_debug_bridge(tc);
             return;
@@ -110,9 +97,7 @@ static void wait_tc358743_pixel_stream(tc358743_t *tc, uint32_t timeout_ms)
         if (waited > 0 && (waited % 2000u) == 0u) {
             ESP_LOGW(CAPTURE_LOG_TAG, "HDMI still unlocked after %" PRIu32 " ms (st=0x%02x)", waited, st);
             tc358743_debug_status(tc);
-            if (!tc_status_is_garbage(st)) {
-                tc358743_debug_bridge(tc);
-            }
+            tc358743_debug_bridge(tc);
         }
         vTaskDelay(pdMS_TO_TICKS(step));
         waited += step;
@@ -131,16 +116,6 @@ static void hardened_hdmi_bringup(tc358743_t *tc)
     for (int i = 1; i <= attempts; i++) {
         ESP_LOGI(CAPTURE_LOG_TAG, "HPD/EDID attempt %d/%d", i, attempts);
         tc358743_debug_status(tc);
-
-        uint8_t st0 = 0;
-        (void)tc358743_sys_status(tc, &st0);
-        if (tc_status_is_garbage(st0)) {
-            ESP_LOGE(CAPTURE_LOG_TAG,
-                     "Attempt %d: I2C garbage (0x%02x) — re-pulse RESETN",
-                     i, st0);
-            tc358743_resetn_pulse();
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
 
         if (i > 1) {
             esp_err_t er = tc358743_hdmi_hotplug_reset(tc);
@@ -198,12 +173,8 @@ void capture_debug_csi_timeout(capture_ctx_t *c, unsigned bpp, size_t fb_bytes)
     }
     if (c && c->tc) {
         tc358743_debug_status(c->tc);
-        uint8_t st = 0;
-        (void)tc358743_sys_status(c->tc, &st);
-        if (!tc_status_is_garbage(st)) {
-            tc358743_debug_bridge(c->tc);
-            tc358743_debug_stall_extras(c->tc);
-        }
+        tc358743_debug_bridge(c->tc);
+        tc358743_debug_stall_extras(c->tc);
     }
 }
 
@@ -285,20 +256,6 @@ capture_ctx_t *capture_hw_init_start(void)
     ESP_ERROR_CHECK(tc358743_init_streaming(s_cap.tc));
     tc358743_set_csi_uyvy422(s_cap.tc, true);
 
-    {
-        uint8_t st = 0;
-        (void)tc358743_sys_status(s_cap.tc, &st);
-        if (tc_status_is_garbage(st)) {
-            ESP_LOGE(CAPTURE_LOG_TAG,
-                     "After init SYS_STATUS=0x%02x (I2C garbage). Reseat CSI ribbon, verify RESETN, power-cycle.",
-                     st);
-            tc358743_resetn_pulse();
-            vTaskDelay(pdMS_TO_TICKS(100));
-            (void)tc358743_sys_status(s_cap.tc, &st);
-            ESP_LOGE(CAPTURE_LOG_TAG, "After re-RESET SYS_STATUS=0x%02x", st);
-        }
-    }
-
     s_cap.hres = P4KVM_CSI_H_RES;
     s_cap.vres = P4KVM_CSI_V_RES;
     s_cap.frame_bytes = (size_t)s_cap.hres * (size_t)s_cap.vres * 2u;
@@ -369,6 +326,7 @@ capture_ctx_t *capture_hw_init_start(void)
     ISP.cntl.isp_en = 0;
     capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
 
+    /* Allocate JPEG path dependencies before long HDMI wait so HTTP is not stuck on "camera starting". */
     hardened_hdmi_bringup(s_cap.tc);
     tc358743_set_csi_uyvy422(s_cap.tc, true);
 
