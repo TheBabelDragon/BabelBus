@@ -2,10 +2,10 @@
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * Waveshare ESP32-P4-WIFI6-DEV-KIT Rev 1.1:
- *   CSI I2C = GPIO7 SDA / GPIO8 SCL (wiki)
- *   Board has external 2.2k pullups — Waveshare demos set enable_internal_pullup=false
- *   Onboard ES8311 shares this bus (addr != 0x0F)
+ * Waveshare ESP32-P4-WIFI6-DEV-KIT Rev 1.1
+ *   I2C CSI: SDA=GPIO7 SCL=GPIO8 (external 2.2k, no internal pullup)
+ *   TC358743 RESETN: GPIO23 (if wired)
+ *   UYVY 422 CSI path
  */
 #include "capture_priv.h"
 
@@ -63,14 +63,13 @@ static void tc358743_resetn_pulse(void)
     vTaskDelay(pdMS_TO_TICKS(50));
     gpio_set_level(rst, 1);
     vTaskDelay(pdMS_TO_TICKS(250));
-    ESP_LOGI(CAPTURE_LOG_TAG, "TC358743 RESETN released on GPIO %d", rst);
+    ESP_LOGI(CAPTURE_LOG_TAG, "TC358743 RESETN GPIO %d", rst);
 #else
-    ESP_LOGW(CAPTURE_LOG_TAG, "TC358743 RESETN not wired");
     vTaskDelay(pdMS_TO_TICKS(500));
 #endif
 }
 
-static bool tc_has_pixel_stream(tc358743_t *tc)
+static bool tc_locked(tc358743_t *tc)
 {
     if (!tc358743_bus_ok(tc)) {
         return false;
@@ -79,65 +78,37 @@ static bool tc_has_pixel_stream(tc358743_t *tc)
     if (tc358743_sys_status(tc, &st) != ESP_OK) {
         return false;
     }
-    return ((st & 0x02) != 0) && ((st & 0x80) != 0);
+    return (st & 0x02) && (st & 0x80); /* TMDS + SYNC */
 }
 
-static void wait_tc358743_pixel_stream(tc358743_t *tc, uint32_t timeout_ms)
+static void wait_hdmi_lock(tc358743_t *tc, uint32_t timeout_ms)
 {
-    const uint32_t step = 100;
     uint32_t waited = 0;
-    ESP_LOGI(CAPTURE_LOG_TAG, "Waiting up to %" PRIu32 " ms for HDMI...", timeout_ms);
-    tc358743_debug_status(tc);
-    bool bus = tc358743_bus_ok(tc);
-    ESP_LOGI(CAPTURE_LOG_TAG, "initial bus_ok=%d", (int)bus);
-
+    ESP_LOGI(CAPTURE_LOG_TAG, "wait HDMI lock up to %" PRIu32 " ms", timeout_ms);
     while (waited < timeout_ms) {
-        if (bus && tc_has_pixel_stream(tc)) {
+        if (tc_locked(tc)) {
             uint8_t st = 0;
             (void)tc358743_sys_status(tc, &st);
-            ESP_LOGI(CAPTURE_LOG_TAG, "HDMI ready SYS=0x%02x after %" PRIu32 " ms", st, waited);
+            ESP_LOGI(CAPTURE_LOG_TAG, "HDMI locked SYS=0x%02x after %" PRIu32 " ms", st, waited);
             return;
         }
-        if ((waited % 1000u) == 0u && waited > 0) {
-            bus = tc358743_bus_ok(tc);
-            uint8_t st = 0;
-            (void)tc358743_sys_status(tc, &st);
-            ESP_LOGW(CAPTURE_LOG_TAG, "waiting %" PRIu32 " ms st=0x%02x bus_ok=%d", waited, st, (int)bus);
-        }
-        vTaskDelay(pdMS_TO_TICKS(step));
-        waited += step;
-    }
-    ESP_LOGW(CAPTURE_LOG_TAG, "HDMI wait ended bus_ok=%d", (int)tc358743_bus_ok(tc));
-}
-
-static void hardened_hdmi_bringup(tc358743_t *tc)
-{
-    ESP_LOGI(CAPTURE_LOG_TAG, "HDMI bring-up");
-    if (!tc358743_bus_ok(tc)) {
-        ESP_LOGE(CAPTURE_LOG_TAG, "TC358743 register map invalid — cannot lock HDMI");
-        return;
-    }
-    ESP_ERROR_CHECK(tc358743_enable_hdmi_output(tc));
-    for (int i = 1; i <= 3; i++) {
-        ESP_LOGI(CAPTURE_LOG_TAG, "HPD attempt %d/3", i);
-        if (i > 1) {
-            (void)tc358743_hdmi_hotplug_reset(tc);
-            vTaskDelay(pdMS_TO_TICKS(300));
-        }
-        wait_tc358743_pixel_stream(tc, 4000);
-        if (tc_has_pixel_stream(tc)) {
-            ESP_LOGI(CAPTURE_LOG_TAG, "HDMI locked");
-            return;
+        vTaskDelay(pdMS_TO_TICKS(100));
+        waited += 100;
+        if ((waited % 1000) == 0) {
+            tc358743_debug_status(tc);
         }
     }
+    ESP_LOGW(CAPTURE_LOG_TAG, "HDMI lock timeout");
+    tc358743_debug_status(tc);
 }
 
 void capture_debug_csi_timeout(capture_ctx_t *c, unsigned bpp, size_t fb_bytes)
 {
-    ESP_LOGW(CAPTURE_LOG_TAG, "CSI stall done_irqs=%" PRIu32 " fb=%zu", c->csi_dma_done_irqs, fb_bytes);
+    (void)bpp;
+    ESP_LOGW(CAPTURE_LOG_TAG, "CSI stall done=%" PRIu32 " fb=%zu", c->csi_dma_done_irqs, fb_bytes);
     if (c && c->tc) {
         tc358743_debug_status(c->tc);
-        (void)tc358743_bus_ok(c->tc);
+        tc358743_log_link_state(c->tc);
     }
 }
 
@@ -185,11 +156,11 @@ static bool IRAM_ATTR cam_on_done(esp_cam_ctlr_handle_t h, esp_cam_ctlr_trans_t 
     if (trans && trans->buffer) {
         c->done_fb = trans->buffer;
     }
-    BaseType_t high_task_woken = pdFALSE;
+    BaseType_t woken = pdFALSE;
     if (c->csi_done_sem) {
-        (void)xSemaphoreGiveFromISR(c->csi_done_sem, &high_task_woken);
+        (void)xSemaphoreGiveFromISR(c->csi_done_sem, &woken);
     }
-    return high_task_woken;
+    return woken;
 }
 
 capture_ctx_t *capture_hw_init_start(void)
@@ -206,24 +177,33 @@ capture_ctx_t *capture_hw_init_start(void)
     i2c_master_bus_handle_t i2c_bus = NULL;
     i2c_master_bus_config_t i2c_bus_cfg = {
         .i2c_port = I2C_NUM_0,
-        .sda_io_num = P4KVM_TC358743_I2C_SDA_GPIO, /* GPIO7 — Waveshare DEV-KIT */
-        .scl_io_num = P4KVM_TC358743_I2C_SCL_GPIO, /* GPIO8 */
+        .sda_io_num = P4KVM_TC358743_I2C_SDA_GPIO,
+        .scl_io_num = P4KVM_TC358743_I2C_SCL_GPIO,
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .glitch_ignore_cnt = 7,
         .intr_priority = 0,
         .trans_queue_depth = 0,
-        /* Board has external 2.2k pullups (Waveshare schematic + wiki demo). */
-        .flags = {.enable_internal_pullup = false},
+        .flags = {.enable_internal_pullup = false}, /* Waveshare external 2.2k */
     };
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus));
-    ESP_LOGI(CAPTURE_LOG_TAG, "I2C0 SDA=GPIO%d SCL=GPIO%d (Waveshare DEV-KIT CSI bus)",
-             P4KVM_TC358743_I2C_SDA_GPIO, P4KVM_TC358743_I2C_SCL_GPIO);
+    ESP_LOGI(CAPTURE_LOG_TAG, "I2C SDA=GPIO%d SCL=GPIO%d", P4KVM_TC358743_I2C_SDA_GPIO,
+             P4KVM_TC358743_I2C_SCL_GPIO);
 
     ESP_ERROR_CHECK(tc358743_probe(i2c_bus, NULL, &s_cap.tc));
     ESP_ERROR_CHECK(tc358743_init_streaming(s_cap.tc));
     tc358743_set_csi_uyvy422(s_cap.tc, true);
 
-    ESP_LOGI(CAPTURE_LOG_TAG, "post-init bus_ok=%d", (int)tc358743_bus_ok(s_cap.tc));
+    if (!tc358743_bus_ok(s_cap.tc)) {
+        ESP_LOGE(CAPTURE_LOG_TAG, "TC358743 CHIPID != 0 after init — bridge not on I2C");
+    } else {
+        ESP_LOGI(CAPTURE_LOG_TAG, "TC358743 CHIPID OK");
+        ESP_ERROR_CHECK(tc358743_enable_hdmi_output(s_cap.tc));
+        wait_hdmi_lock(s_cap.tc, 5000);
+        if (!tc_locked(s_cap.tc)) {
+            (void)tc358743_hdmi_hotplug_reset(s_cap.tc);
+            wait_hdmi_lock(s_cap.tc, 5000);
+        }
+    }
 
     s_cap.hres = P4KVM_CSI_H_RES;
     s_cap.vres = P4KVM_CSI_V_RES;
@@ -234,7 +214,7 @@ capture_ctx_t *capture_hw_init_start(void)
     uint8_t *blk = heap_caps_aligned_calloc(align, CAPTURE_FB_COUNT, s_cap.frame_bytes,
                                             MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!blk) {
-        ESP_LOGE(CAPTURE_LOG_TAG, "CSI FB alloc fail");
+        ESP_LOGE(CAPTURE_LOG_TAG, "FB alloc fail");
         vTaskDelete(NULL);
         return NULL;
     }
@@ -245,7 +225,6 @@ capture_ctx_t *capture_hw_init_start(void)
     s_cap.done_fb = NULL;
     s_cap.csi_dma_done_irqs = 0;
     s_cap.csi_get_new_irqs = 0;
-
     s_cap.csi_done_sem = xSemaphoreCreateCounting(32, 0);
     if (!s_cap.csi_done_sem) {
         vTaskDelete(NULL);
@@ -290,39 +269,29 @@ capture_ctx_t *capture_hw_init_start(void)
     ISP.cntl.isp_en = 0;
     capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
 
-    hardened_hdmi_bringup(s_cap.tc);
-    tc358743_set_csi_uyvy422(s_cap.tc, true);
+    if (tc358743_bus_ok(s_cap.tc)) {
+        tc358743_set_csi_uyvy422(s_cap.tc, true);
+    }
 
-    capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
     ESP_ERROR_CHECK(esp_cam_ctlr_start(s_cam));
     s_cam_started = true;
-    ESP_LOGI(CAPTURE_LOG_TAG, "esp_cam_ctlr_start");
+    ESP_LOGI(CAPTURE_LOG_TAG, "CSI started");
     return &s_cap;
-}
-
-static void capture_drain_csi_done_sem(SemaphoreHandle_t sem)
-{
-    if (!sem) {
-        return;
-    }
-    while (xSemaphoreTake(sem, 0) == pdTRUE) {
-    }
 }
 
 esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
 {
-    ESP_RETURN_ON_FALSE(c && c->tc && c->csi_done_sem, ESP_ERR_INVALID_ARG, CAPTURE_LOG_TAG, "ctx");
-    ESP_RETURN_ON_FALSE(s_cam, ESP_ERR_INVALID_STATE, CAPTURE_LOG_TAG, "cam");
+    ESP_RETURN_ON_FALSE(c && c->tc && s_cam, ESP_ERR_INVALID_ARG, CAPTURE_LOG_TAG, "ctx");
     if (s_cam_started) {
         (void)esp_cam_ctlr_stop(s_cam);
         s_cam_started = false;
     }
-    capture_drain_csi_done_sem(c->csi_done_sem);
     if (!tc358743_bus_ok(c->tc)) {
         return ESP_ERR_INVALID_STATE;
     }
-    wait_tc358743_pixel_stream(c->tc, 4000);
-    if (!tc_has_pixel_stream(c->tc)) {
+    (void)tc358743_hdmi_hotplug_reset(c->tc);
+    wait_hdmi_lock(c->tc, 5000);
+    if (!tc_locked(c->tc)) {
         return ESP_ERR_INVALID_STATE;
     }
     tc358743_set_csi_uyvy422(c->tc, true);
@@ -333,9 +302,8 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     c->csi_dma_done_irqs = 0;
     c->csi_get_new_irqs = 0;
     esp_err_t er = esp_cam_ctlr_start(s_cam);
-    if (er != ESP_OK) {
-        return er;
+    if (er == ESP_OK) {
+        s_cam_started = true;
     }
-    s_cam_started = true;
-    return ESP_OK;
+    return er;
 }
