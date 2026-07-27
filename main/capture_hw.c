@@ -43,7 +43,6 @@
 static esp_cam_ctlr_handle_t s_cam;
 static isp_proc_handle_t s_isp_bypass;
 static bool s_cam_started;
-/* CSI-2 RGB888 user data type — same as p4kvm. */
 static const uint32_t s_csi_expected_dt = 0x24u;
 static capture_ctx_t s_cap;
 
@@ -103,14 +102,12 @@ static bool tc_locked(tc358743_t *tc)
         return false;
     }
     (void)tc358743_read_chip_id(tc, &id);
-
     if ((id & 0xffu) == ((id >> 8) & 0xffu) && (id & 0xffu) != 0) {
         return false;
     }
     if (st == 0xffu || st == 0xdfu || st == 0x7fu || st == 0x9fu || st == 0xf7u || st == 0xfdu) {
         return false;
     }
-
     return ((st & 0x02) != 0) && ((st & 0x80) != 0);
 }
 
@@ -162,7 +159,6 @@ static void after_hdmi_lock(tc358743_t *tc)
         ESP_LOGI(CAPTURE_LOG_TAG, "HDMI timing HAct=%u VAct=%u",
                  (unsigned)hact, (unsigned)vact);
     }
-    /* RGB888 path — do NOT force UYVY. */
     tc358743_set_csi_uyvy422(tc, false);
     (void)tc358743_reapply_csi_path_after_hdmi(tc);
     (void)tc358743_set_streaming(tc, true);
@@ -186,7 +182,7 @@ void capture_debug_csi_timeout(capture_ctx_t *c, unsigned bpp, size_t fb_bytes)
     }
     if (c && c->tc) {
         tc358743_debug_status(c->tc);
-        tc358743_log_link_state(c->tc);
+        tc358743_debug_bridge(c->tc);
         uint16_t hact = 0, vact = 0;
         if (tc358743_get_detected_timing(c->tc, &hact, &vact) == ESP_OK) {
             ESP_LOGW(CAPTURE_LOG_TAG, "stall timing HAct=%u VAct=%u (CSI %ux%u)",
@@ -273,15 +269,13 @@ capture_ctx_t *capture_hw_init_start(void)
     i2c_bus_scan(i2c_bus);
     if (!tc358743_present(i2c_bus)) {
         ESP_LOGE(CAPTURE_LOG_TAG,
-                 "FATAL: TC358743 not responding at 0x0F after RESET. "
-                 "CSI will not be started.");
+                 "FATAL: TC358743 not responding at 0x0F after RESET. CSI will not be started.");
         vTaskDelete(NULL);
         return NULL;
     }
 
     ESP_ERROR_CHECK(tc358743_probe(i2c_bus, NULL, &s_cap.tc));
     ESP_ERROR_CHECK(tc358743_init_streaming(s_cap.tc));
-    /* Default CSI color is RGB888 (csi_uyvy422=false in init). */
     tc358743_log_link_state(s_cap.tc);
 
     {
@@ -301,13 +295,11 @@ capture_ctx_t *capture_hw_init_start(void)
         (void)tc358743_hdmi_hotplug_reset(s_cap.tc);
         wait_hdmi_lock(s_cap.tc, 5000);
     }
-
     if (tc_locked(s_cap.tc)) {
         after_hdmi_lock(s_cap.tc);
     }
 
     resolve_capture_size(s_cap.tc, &s_cap.hres, &s_cap.vres);
-    /* RGB888 = 3 bytes/pixel */
     s_cap.frame_bytes = (size_t)s_cap.hres * (size_t)s_cap.vres * 3u;
 
     size_t align = 0;
@@ -389,9 +381,7 @@ capture_ctx_t *capture_hw_init_start(void)
 esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
 {
     ESP_RETURN_ON_FALSE(c && c->tc && s_cam, ESP_ERR_INVALID_ARG, CAPTURE_LOG_TAG, "ctx");
-
     const bool locked = tc_locked(c->tc);
-
     if (locked) {
         ESP_LOGW(CAPTURE_LOG_TAG, "CSI soft recover (stream re-assert only, no CTXRST)");
         capture_configure_p4_csi_bridge(c->hres, c->vres);
@@ -400,7 +390,6 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
         (void)tc358743_set_streaming(c->tc, true);
         return ESP_OK;
     }
-
     ESP_LOGW(CAPTURE_LOG_TAG, "CSI hard recover (HDMI unlocked — HPD cycle)");
     if (s_cam_started) {
         (void)esp_cam_ctlr_stop(s_cam);
