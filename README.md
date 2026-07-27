@@ -11,7 +11,7 @@ Based on Jonathan Rowny’s [p4kvm](https://github.com/jrowny/p4kvm) (Apache-2.0
 ## What it does
 
 - HDMI capture via Toshiba TC358743 → CSI on ESP32-P4
-- Hardware **JPEG** encode (RGB888 path only — no H.264)
+- Hardware **JPEG** encode (UYVY 422 path)
 - MJPEG multipart stream: `GET /stream`
 - Optional **I2S audio** from the adapter’s flying leads: `GET /audio` (raw s16le stereo ~48 kHz)
 - Ethernet (default) and optional **Wi‑Fi STA** via onboard ESP32-C6 (ESP-Hosted)
@@ -32,6 +32,8 @@ Based on Jonathan Rowny’s [p4kvm](https://github.com/jrowny/p4kvm) (Apache-2.0
 ### Video (CSI ribbon)
 
 Use the **larger** FPC into the P4 **MIPI-CSI** connector (Pi-camera compatible). I2C for the bridge is expected on that path (SDA=GPIO7, SCL=GPIO8).
+
+Internal I2C pull-ups are enabled in firmware (required for many FPC / adapter combinations).
 
 ### Audio flying leads (your labels)
 
@@ -77,6 +79,32 @@ I2S is enabled by default. Stream: `http://<device>/audio`
 | `/stream`       | MJPEG multipart                                  |
 | `/jpeg-quality` | GET; `?q=1..100` sets quality                    |
 | `/audio`        | Raw PCM s16le stereo (when I2S enabled)          |
+
+## Troubleshooting the funny log
+
+If you see something like:
+
+```
+I2C scan: 1 device(s)
+  ACK at 0x18
+CHIPID=0xdfdf SYS_STATUS=0xdf
+HDMI lock timeout (SYS fill cannot count as lock)
+csi frame wait timeout (dma_done_irqs=0)
+```
+
+that means the **TC358743 is not on the I2C bus**.
+
+- `0x18` is the onboard ES8311 audio codec (board I2C is fine).
+- `0x0F` (TC358743) is missing → all register reads return mono-fill `0xDF`, the lock detector correctly refuses to believe the “TMDS=1 SYNC=1” bits, and CSI never sees a frame.
+
+**Checklist**
+
+1. Reseat the **large** CSI FPC (orientation + full insertion into the MIPI-CSI connector).
+2. Confirm adapter **RESETN** is wired to GPIO 23 (or set the correct GPIO in menuconfig).
+3. Adapter has power (some need 5 V as well as the CSI power from the P4).
+4. Rebuild with the current main (internal I2C pull-ups are enabled).
+
+When it is healthy the scan should show **both** `0x0F` and usually `0x18`, and CHIPID will not be a repeated byte.
 
 ## Security
 
