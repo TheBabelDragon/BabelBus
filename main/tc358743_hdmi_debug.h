@@ -9,13 +9,14 @@
  *  bit0 DDC5V  bit1 TMDS  bit2 PHY_PLL  bit3 PHY_SCDT
  *  bit4 HDMI   bit5 HDCP  bit6 AVMUTE  bit7 SYNC
  *
- * If *every* register reads 0x7F/0x7F7F (and multi-byte I2C returns
- * ESP_ERR_INVALID_RESPONSE), the bus is broken or RMW poisoned the chip.
- * That is NOT real TMDS/HDCP — do not treat it as an HDMI handshake.
+ * When I2C is broken, *every* register often returns the same byte
+ * (0x7F, 0x97, 0xFF, ...). That is NOT HDMI status. Multi-byte reads
+ * typically fail with ESP_ERR_INVALID_RESPONSE at the same time.
  */
 static inline bool tc358743_status_looks_like_i2c_garbage(uint8_t st)
 {
-    return st == 0x7fu || st == 0xffu;
+    /* Common stuck patterns seen on this board when CSI-I2C is unhealthy. */
+    return st == 0x7fu || st == 0x97u || st == 0xffu || st == 0x00u;
 }
 
 static inline void tc358743_debug_status(tc358743_t *dev)
@@ -40,11 +41,15 @@ static inline void tc358743_debug_status(tc358743_t *dev)
              "SYS_STATUS=0x%02x DDC5V=%d TMDS=%d PLL=%d SCDT=%d HDMI=%d HDCP=%d AVMUTE=%d SYNC=%d",
              st, ddc, tmds, pll, scdt, hdmi, hdcp, avmute, sync);
 
-    if (tc358743_status_looks_like_i2c_garbage(st)) {
+    /*
+     * Unplugged + TMDS/SYNC set, or uniform fill across the dump, means bus garbage.
+     * Real idle unplugged is near 0x00/0x01, not 0x97 on SYS and CONFCTL and VI_MUTE.
+     */
+    if (st == 0x97u || st == 0x7fu || st == 0xffu) {
         ESP_LOGE("tc358743",
-                 "SYS_STATUS 0x%02x looks like I2C garbage (all-ones pattern). "
-                 "Not a real HDMI lock. Check CSI ribbon (SDA/SCL), RESETN wiring, "
-                 "and that writes are not read-modify-write on failed reads.",
+                 "SYS_STATUS 0x%02x is a stuck I2C fill pattern (also see CONFCTL/VI all same + "
+                 "AVI ESP_ERR_INVALID_RESPONSE). Reseat CSI ribbon (SDA/SCL), check RESETN, "
+                 "power-cycle. Do not treat as HDMI lock.",
                  st);
         return;
     }
