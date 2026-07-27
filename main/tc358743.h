@@ -64,7 +64,6 @@ void tc358743_debug_bridge(tc358743_t *dev);
 
 void tc358743_debug_stall_extras(tc358743_t *dev);
 
-/** Always-on UART dump of CHIPID / HPD / PHY / CSI / timing (no ADV_DEBUG needed). */
 void tc358743_log_link_state(tc358743_t *dev);
 
 esp_err_t tc358743_set_streaming(tc358743_t *dev, bool on);
@@ -73,7 +72,12 @@ esp_err_t tc358743_read_chip_id(tc358743_t *dev, uint16_t *chip_id);
 
 esp_err_t tc358743_sys_status(tc358743_t *dev, uint8_t *out_st);
 
-/** Measured HDMI active timing from bridge (0 if unlocked / invalid). */
+/**
+ * False if I2C returns uniform fill (SYS==VI==CONFCTL pattern) so TMDS bits
+ * in SYS_STATUS must not be trusted for lock.
+ */
+bool tc358743_bus_ok(tc358743_t *dev);
+
 esp_err_t tc358743_get_detected_timing(tc358743_t *dev, uint16_t *hact, uint16_t *vact);
 
 esp_err_t tc358743_get_avi_color_format(tc358743_t *dev, uint8_t *out_y);
