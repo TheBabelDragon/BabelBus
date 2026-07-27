@@ -315,11 +315,19 @@ static void wr32(tc358743_t *d, uint16_t r, uint32_t v)
     i2c_write_reg(d, r, le, 4);
 }
 
-static uint8_t rd8(tc358743_t *d, uint16_t r)
+uint8_t tc358743_rd8(tc358743_t *d, uint16_t r)
 {
     uint8_t v = 0;
+    if (!d) {
+        return 0;
+    }
     i2c_read_reg(d, r, &v, 1);
     return v;
+}
+
+static uint8_t rd8(tc358743_t *d, uint16_t r)
+{
+    return tc358743_rd8(d, r);
 }
 
 static uint16_t rd16(tc358743_t *d, uint16_t r)
@@ -500,7 +508,6 @@ static void initial_setup(tc358743_t *d)
     wr16(d, FIFOCTL, pdata->fifo_level);
     set_ref_clk(d);
     wr8_and_or(d, DDC_CTL, (uint8_t)~MASK_DDC5V_MODE, pdata->ddc5v_mode & MASK_DDC5V_MODE);
-    /* EDID over DDC — source will read our RAM as a monitor */
     wr8_and_or(d, EDID_MODE, (uint8_t)~MASK_EDID_MODE, MASK_EDID_MODE_E_DDC);
 
     set_hdmi_phy(d);
@@ -600,10 +607,6 @@ static void hpd_set(tc358743_t *d, bool on)
     wr8_and_or(d, HPD_CTL, (uint8_t)~MASK_HPD_OUT0, on ? MASK_HPD_OUT0 : 0);
 }
 
-/**
- * Load the built-in 1080p EDID into the bridge RAM while HPD is low.
- * Source must not be doing DDC during this window.
- */
 static void edid_write_builtin(tc358743_t *d)
 {
     const uint16_t edid_len = TC358743_EDID_TOTAL_LEN;
@@ -616,20 +619,13 @@ static void edid_write_builtin(tc358743_t *d)
     ESP_LOGI(TAG, "EDID loaded (%u bytes) — presenting as 1080p monitor", (unsigned)edid_len);
 }
 
-/**
- * Present as a simple monitor: stream on, then HPD high so the source
- * sees a sink, reads our EDID, and starts TMDS.
- */
 static void present_as_monitor(tc358743_t *d)
 {
     enable_stream(d, true);
     vTaskDelay(pdMS_TO_TICKS(50));
-
-    /* Rising HPD edge = "monitor plugged in" */
     hpd_set(d, true);
     ESP_LOGI(TAG, "HPD asserted — source should see a 1080p monitor and start TMDS");
     vTaskDelay(pdMS_TO_TICKS(200));
-
     wr32(d, CSI_START, MASK_STRT);
 }
 
@@ -686,13 +682,6 @@ esp_err_t tc358743_init_streaming(tc358743_t *d)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
 
-    /*
-     * Boot as a simple monitor:
-     *  1. HPD low  — source must not DDC yet
-     *  2. Full register setup + EDID into RAM
-     *  3. PLL / CSI ready
-     *  4. Caller raises HPD via tc358743_enable_hdmi_output()
-     */
     hpd_set(d, false);
     vTaskDelay(pdMS_TO_TICKS(50));
 
@@ -727,14 +716,10 @@ esp_err_t tc358743_enable_hdmi_output(tc358743_t *d)
 esp_err_t tc358743_hdmi_hotplug_reset(tc358743_t *d)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
-    /*
-     * Full unplug → plug cycle so the source re-reads EDID and restarts TMDS.
-     * Same as physically unplugging and re-plugging an HDMI monitor.
-     */
     ESP_LOGI(TAG, "HDMI hotplug reset (unplug → plug as 1080p monitor)");
     enable_stream(d, false);
     hpd_set(d, false);
-    vTaskDelay(pdMS_TO_TICKS(300));   /* long enough for source to notice unplug */
+    vTaskDelay(pdMS_TO_TICKS(300));
     return tc358743_enable_hdmi_output(d);
 }
 
@@ -746,25 +731,6 @@ esp_err_t tc358743_reapply_csi_path_after_hdmi(tc358743_t *d)
     wr32(d, CSI_START, MASK_STRT);
     return ESP_OK;
 }
-
-#if CONFIG_P4KVM_TC358743_ADV_DEBUG
-static uint16_t tc358743_read_hact_vact_htotal(tc358743_t *d, uint16_t *vact, uint16_t *htotal,
-                                               uint16_t *vtotal)
-{
-    uint8_t h0 = rd8(d, HACT0);
-    uint8_t h1 = rd8(d, HACT1);
-    uint8_t v0 = rd8(d, VACT0);
-    uint8_t v1 = rd8(d, VACT1);
-    uint8_t ht0 = rd8(d, HTOTAL0);
-    uint8_t ht1 = rd8(d, HTOTAL1);
-    uint8_t vt0 = rd8(d, VTOTAL0);
-    uint8_t vt1 = rd8(d, VTOTAL1);
-    *vact = (uint16_t)v0 | (uint16_t)((v1 & 0x1fu) << 8);
-    *htotal = (uint16_t)ht0 | (uint16_t)((ht1 & 0x1fu) << 8);
-    *vtotal = (uint16_t)vt0 | (uint16_t)((vt1 & 0x3fu) << 8);
-    return (uint16_t)h0 | (uint16_t)((h1 & 0x1fu) << 8);
-}
-#endif
 
 esp_err_t tc358743_get_avi_color_format(tc358743_t *d, uint8_t *out_y)
 {
@@ -789,44 +755,7 @@ void tc358743_debug_stall_extras(tc358743_t *d)
 #if !CONFIG_P4KVM_TC358743_ADV_DEBUG
     (void)d;
 #else
-    if (!d) {
-        return;
-    }
-    uint16_t conf = rd16(d, CONFCTL);
-    unsigned yfmt = (unsigned)((conf >> 6) & 3u);
-    ESP_LOGW(TAG,
-             "stall CONFCTL=0x%04x YCbCrFmt=%u (0=444 1=422_12 2=colorbar 3=422_8) VBUFEN:%u ABUFEN:%u",
-             conf, yfmt, (unsigned)(conf & 1u), (unsigned)((conf >> 1) & 1u));
-
-    uint32_t csi_err = rd32(d, CSI_ERR);
-    ESP_LOGW(TAG,
-             "stall CSI_ERR=0x%08" PRIx32 " (Linux: INER=0x200 WCER=0x100 QUNK=0x10 TXBRK=0x2)", csi_err);
-
-    uint8_t avi[24];
-    memset(avi, 0, sizeof(avi));
-    esp_err_t er = i2c_read_reg(d, PK_AVI_0HEAD, avi, PK_AVI_LEN);
-    if (er != ESP_OK) {
-        ESP_LOGW(TAG, "stall AVI read %s", esp_err_to_name(er));
-        return;
-    }
-    ESP_LOG_BUFFER_HEX_LEVEL(TAG, avi, PK_AVI_LEN, ESP_LOG_WARN);
-    if (PK_AVI_LEN >= 4u) {
-        ESP_LOGW(TAG,
-                 "stall AVI layout: HB=[%02x %02x %02x] chksum=%02x PB0=%02x PB1=%02x PB2=%02x PB3=%02x",
-                 avi[0], avi[1], avi[2], avi[3], avi[4], avi[5], avi[6], avi[7]);
-    }
-
-    if (avi[0] == 0x82u && avi[2] >= 2u && PK_AVI_LEN >= 6u) {
-        uint8_t pb1 = avi[5];
-        unsigned y = (unsigned)(pb1 >> 5) & 7u;
-        const char *ys =
-            (y == 0) ? "RGB" : (y == 1) ? "YCbCr422" : (y == 2) ? "YCbCr444" : (y == 3) ? "YCbCr420" : "other/RSVD";
-        ESP_LOGW(TAG, "stall AVI CEA: PB1 Y=%u (%s)", y, ys);
-        if (PK_AVI_LEN > 8u) {
-            unsigned vic = (unsigned)(avi[8] & 0x7fu);
-            ESP_LOGW(TAG, "stall AVI CEA: PB4 VIC=%u", vic);
-        }
-    }
+    (void)d;
 #endif
 }
 
@@ -835,42 +764,7 @@ void tc358743_debug_bridge(tc358743_t *d)
 #if !CONFIG_P4KVM_TC358743_ADV_DEBUG
     (void)d;
 #else
-    if (!d) {
-        return;
-    }
-    uint8_t sys = rd8(d, SYS_STATUS);
-    uint8_t vi = rd8(d, VI_STATUS1);
-    uint8_t vi2 = rd8(d, VI_STATUS2);
-    uint8_t vi3 = rd8(d, VI_STATUS3);
-    uint8_t clkst = rd8(d, CLK_STATUS);
-    uint8_t phyerr = rd8(d, PHYERR_STATUS);
-    uint8_t hdmi_dvi = rd8(d, HDMI_DVI);
-    uint16_t csi = rd16(d, CSI_STATUS);
-    uint16_t csi_ctl = rd16(d, CSI_CONTROL);
-    uint16_t csi_int = rd16(d, CSI_INT);
-    uint16_t intst = rd16(d, INTSTATUS);
-    uint16_t conf = rd16(d, CONFCTL);
-    uint8_t vout2 = rd8(d, VOUT_SET2);
-    uint8_t vimute = rd8(d, VI_MUTE);
-    uint16_t vact = 0, htotal = 0, vtotal = 0;
-    uint16_t hact = tc358743_read_hact_vact_htotal(d, &vact, &htotal, &vtotal);
-
-    unsigned csi_hlt = (unsigned)(csi & 1u);
-    unsigned csi_rxact = (unsigned)((csi >> 8) & 1u);
-    unsigned csi_txact = (unsigned)((csi >> 9) & 1u);
-    unsigned csi_wsync = (unsigned)((csi >> 10) & 1u);
-    unsigned csi_int_hlt = (unsigned)((csi_int >> 3) & 1u);
-    unsigned csi_inter = (unsigned)((csi_int >> 2) & 1u);
-
-    ESP_LOGW(TAG,
-             "bridge SYS=0x%02x VI1=0x%02x VI2=0x%02x VI3=0x%02x CONFCTL=0x%04x VOUT2=0x%02x VI_MUTE=0x%02x",
-             sys, vi, vi2, vi3, conf, vout2, vimute);
-    ESP_LOGW(TAG,
-             "  timing HAct=%u VAct=%u HTot=%u VTot=%u | HDMI_DVI=0x%02x CLK_ST=0x%02x PHYERR=0x%02x INTSTATUS=0x%04x",
-             (unsigned)hact, (unsigned)vact, (unsigned)htotal, (unsigned)vtotal, hdmi_dvi, clkst, phyerr, intst);
-    ESP_LOGW(TAG,
-             " CSI_STATUS=0x%04x (Hlt:%u RxAct:%u TxAct:%u WSync:%u) CSIctl=0x%04x CSIint=0x%04x (IntHlt:%u INTER:%u)",
-             csi, csi_hlt, csi_rxact, csi_txact, csi_wsync, csi_ctl, csi_int, csi_int_hlt, csi_inter);
+    (void)d;
 #endif
 }
 
