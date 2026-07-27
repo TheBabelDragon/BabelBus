@@ -22,10 +22,20 @@
 
 static jpeg_encoder_handle_t s_jpeg_enc;
 
+/* Encode at most this many frames/sec to keep latency down. */
+#ifndef BABELBUS_TARGET_FPS
+#define BABELBUS_TARGET_FPS 15
+#endif
+
 void capture_mjpeg_run(capture_ctx_t *c)
 {
     jpeg_encode_engine_cfg_t jcfg = {.intr_priority = 0, .timeout_ms = 500};
     ESP_ERROR_CHECK(jpeg_new_encoder_engine(&jcfg, &s_jpeg_enc));
+
+    if (g_jpeg_frame.jpeg_quality < 1u || g_jpeg_frame.jpeg_quality > 100u) {
+        g_jpeg_frame.jpeg_quality = 55u;
+    }
+    jpeg_quality_load_from_nvs();
 
     const size_t jpeg_cap = (size_t)CAPTURE_MAX_H * (size_t)CAPTURE_MAX_V + 384u * 1024u;
     jpeg_encode_memory_alloc_cfg_t jmem = {.buffer_direction = JPEG_ENC_ALLOC_OUTPUT_BUFFER};
@@ -57,24 +67,28 @@ void capture_mjpeg_run(capture_ctx_t *c)
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(CAPTURE_LOG_TAG, "JPEG path ready — waiting for CSI frames");
+    ESP_LOGI(CAPTURE_LOG_TAG, "JPEG path ready q=%u target_fps=%d",
+             (unsigned)g_jpeg_frame.jpeg_quality, BABELBUS_TARGET_FPS);
 
     const unsigned bpp = capture_csi_bpp();
     int64_t hdmi_recover_cooldown_until_us = 0;
     uint32_t last_logged_done = 0;
+    int64_t last_encode_us = 0;
+    const int64_t min_encode_interval_us = (int64_t)(1000000 / BABELBUS_TARGET_FPS);
 
     while (1) {
-        if (xSemaphoreTake(c->csi_done_sem, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        if (xSemaphoreTake(c->csi_done_sem, pdMS_TO_TICKS(1500)) != pdTRUE) {
             ESP_LOGW(CAPTURE_LOG_TAG, "csi frame wait timeout (dma_done_irqs=%lu)",
                      (unsigned long)c->csi_dma_done_irqs);
             capture_debug_csi_timeout(c, bpp, c->frame_bytes);
             int64_t now = (int64_t)esp_timer_get_time();
             if (now >= hdmi_recover_cooldown_until_us) {
                 (void)capture_hw_hdmi_recover(c);
-                hdmi_recover_cooldown_until_us = now + (int64_t)3 * 1000000;
+                hdmi_recover_cooldown_until_us = now + (int64_t)2 * 1000000;
             }
             continue;
         }
+        /* Frames flowing — do not recover. */
         hdmi_recover_cooldown_until_us = 0;
         while (xSemaphoreTake(c->csi_done_sem, 0) == pdTRUE) {
         }
@@ -83,14 +97,29 @@ void capture_mjpeg_run(capture_ctx_t *c)
         if (!src) {
             continue;
         }
+
+        /* No browser client → skip encode (keeps CSI alive, saves CPU). */
+        if (jpeg_frame_stream_client_count() <= 0) {
+            continue;
+        }
+
+        int64_t now = (int64_t)esp_timer_get_time();
+        if ((now - last_encode_us) < min_encode_interval_us) {
+            continue; /* drop frame for latency */
+        }
+
         ESP_ERROR_CHECK(esp_cache_msync(src, c->frame_bytes, ESP_CACHE_MSYNC_FLAG_DIR_M2C));
 
         if (c->csi_dma_done_irqs == 1 ||
             (c->csi_dma_done_irqs - last_logged_done) >= 300u) {
             const uint8_t *p = (const uint8_t *)src;
             uint32_t sum = 0;
-            for (size_t i = 0; i < 256 && i < c->frame_bytes; i++) {
+            size_t mid = c->frame_bytes / 2u;
+            for (size_t i = 0; i < 128 && i < c->frame_bytes; i++) {
                 sum += p[i];
+            }
+            for (size_t i = 0; i < 128 && (mid + i) < c->frame_bytes; i++) {
+                sum += p[mid + i];
             }
             ESP_LOGI(CAPTURE_LOG_TAG, "frame ok done=%lu jpeg_seq=%lu %ux%u pixsum256=%lu",
                      (unsigned long)c->csi_dma_done_irqs, (unsigned long)g_jpeg_frame.frame_seq,
@@ -112,7 +141,7 @@ void capture_mjpeg_run(capture_ctx_t *c)
         const uint32_t jpeg_in_bytes = (uint32_t)c->frame_bytes;
         uint32_t out_sz = 0;
         int back = -1;
-        for (;;) {
+        for (int tries = 0; tries < 20; tries++) {
             if (xSemaphoreTake(g_jpeg_frame.mutex, portMAX_DELAY) != pdTRUE) {
                 continue;
             }
@@ -123,6 +152,9 @@ void capture_mjpeg_run(capture_ctx_t *c)
             }
             xSemaphoreGive(g_jpeg_frame.mutex);
             vTaskDelay(pdMS_TO_TICKS(1));
+        }
+        if (back < 0) {
+            continue; /* all slots busy — drop */
         }
 
         esp_err_t er = jpeg_encoder_process(s_jpeg_enc, &enc, src, jpeg_in_bytes, g_jpeg_frame.jpeg_buf[back],
@@ -141,5 +173,6 @@ void capture_mjpeg_run(capture_ctx_t *c)
             xSemaphoreGive(g_jpeg_frame.mutex);
         }
         jpeg_frame_notify_new_frame();
+        last_encode_us = now;
     }
 }
