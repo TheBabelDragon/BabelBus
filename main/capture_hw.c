@@ -35,6 +35,7 @@
 #include "soc/isp_struct.h"
 #include "soc/mipi_csi_bridge_struct.h"
 
+#include "i2c_guard.h"
 #include "tc358743.h"
 #include "tc358743_hdmi_debug.h"
 
@@ -58,7 +59,6 @@ static void tc358743_resetn_pulse(void)
         .intr_type = GPIO_INTR_DISABLE,
     };
     ESP_ERROR_CHECK(gpio_config(&io));
-    /* Active-low RESETN: hold longer so a previously poisoned chip fully POR. */
     gpio_set_level(rst, 0);
     vTaskDelay(pdMS_TO_TICKS(50));
     gpio_set_level(rst, 1);
@@ -70,10 +70,9 @@ static void tc358743_resetn_pulse(void)
 #endif
 }
 
-/** 0x7F/0xFF on SYS_STATUS is I2C garbage, not HDMI lock. */
 static bool tc_status_is_garbage(uint8_t st)
 {
-    return st == 0x7fu || st == 0xffu;
+    return tc358743_byte_is_bus_garbage(st);
 }
 
 static bool tc_has_pixel_stream(tc358743_t *tc)
@@ -85,7 +84,7 @@ static bool tc_has_pixel_stream(tc358743_t *tc)
     if (tc_status_is_garbage(st)) {
         return false;
     }
-    return ((st & 0x02) != 0) && ((st & 0x80) != 0); /* TMDS + SYNC */
+    return ((st & 0x02) != 0) && ((st & 0x80) != 0);
 }
 
 static void wait_tc358743_pixel_stream(tc358743_t *tc, uint32_t timeout_ms)
@@ -137,7 +136,7 @@ static void hardened_hdmi_bringup(tc358743_t *tc)
         (void)tc358743_sys_status(tc, &st0);
         if (tc_status_is_garbage(st0)) {
             ESP_LOGE(CAPTURE_LOG_TAG,
-                     "Attempt %d: I2C garbage (0x%02x) — re-pulse RESETN and skip poison RMW path",
+                     "Attempt %d: I2C garbage (0x%02x) — re-pulse RESETN",
                      i, st0);
             tc358743_resetn_pulse();
             vTaskDelay(pdMS_TO_TICKS(100));
