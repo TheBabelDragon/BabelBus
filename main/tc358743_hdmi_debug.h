@@ -18,16 +18,26 @@ static inline void tc358743_debug_status(tc358743_t *dev)
     if (tc358743_sys_status(dev, &st) != ESP_OK) {
         return;
     }
+    const int ddc = (int)(st & 1);
+    const int tmds = (int)((st >> 1) & 1);
+    const int pll = (int)((st >> 2) & 1);
+    const int scdt = (int)((st >> 3) & 1);
+    const int hdmi = (int)((st >> 4) & 1);
+    const int hdcp = (int)((st >> 5) & 1);
+    const int avmute = (int)((st >> 6) & 1);
+    const int sync = (int)((st >> 7) & 1);
     ESP_LOGI("tc358743",
              "SYS_STATUS=0x%02x DDC5V=%d TMDS=%d PLL=%d SCDT=%d HDMI=%d HDCP=%d AVMUTE=%d SYNC=%d",
-             st, (int)(st & 1), (int)((st >> 1) & 1), (int)((st >> 2) & 1), (int)((st >> 3) & 1),
-             (int)((st >> 4) & 1), (int)((st >> 5) & 1), (int)((st >> 6) & 1), (int)((st >> 7) & 1));
-    /*
-     * DDC5V must follow the HDMI cable. If it stays 1 with the cable unplugged,
-     * the adapter's +5V sense is backfed or stuck — software cannot clear that.
-     */
-    if ((st & 1) != 0 && ((st >> 1) & 1) == 0) {
-        ESP_LOGW("tc358743",
-                 "DDC5V=1 but TMDS=0: cable-sense may be stuck/backfed (confirm DDC5V=0 with HDMI unplugged)");
+             st, ddc, tmds, pll, scdt, hdmi, hdcp, avmute, sync);
+
+    if (tmds && !sync) {
+        if (avmute || hdcp) {
+            ESP_LOGW("tc358743",
+                     "TMDS up but SYNC=0 (AVMUTE=%d HDCP=%d): source is muting/protecting — "
+                     "disable HDCP on the source or use a non-HDCP output; CSI cannot stream muted video",
+                     avmute, hdcp);
+        } else {
+            ESP_LOGW("tc358743", "TMDS up but SYNC=0 (no AVMUTE) — waiting for stable frame sync");
+        }
     }
 }
