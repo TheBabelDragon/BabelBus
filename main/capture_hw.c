@@ -35,7 +35,6 @@
 #include "soc/isp_struct.h"
 #include "soc/mipi_csi_bridge_struct.h"
 
-#include "i2c_guard.h"
 #include "tc358743.h"
 #include "tc358743_hdmi_debug.h"
 
@@ -70,13 +69,16 @@ static void tc358743_resetn_pulse(void)
 #endif
 }
 
+/** Real lock: TMDS+SYNC and register map is not uniform I2C fill. */
 static bool tc_has_pixel_stream(tc358743_t *tc)
 {
+    if (!tc358743_bus_ok(tc)) {
+        return false;
+    }
     uint8_t st = 0;
     if (tc358743_sys_status(tc, &st) != ESP_OK) {
         return false;
     }
-    /* TMDS + SYNC. Do not reject 0xDF-style patterns as "garbage". */
     return ((st & 0x02) != 0) && ((st & 0x80) != 0);
 }
 
@@ -84,32 +86,42 @@ static void wait_tc358743_pixel_stream(tc358743_t *tc, uint32_t timeout_ms)
 {
     const uint32_t step = 50;
     uint32_t waited = 0;
-    ESP_LOGI(CAPTURE_LOG_TAG, "Waiting up to %" PRIu32 " ms for HDMI TMDS+SYNC...", timeout_ms);
+    ESP_LOGI(CAPTURE_LOG_TAG, "Waiting up to %" PRIu32 " ms for HDMI TMDS+SYNC (bus must be ok)...", timeout_ms);
     tc358743_debug_status(tc);
+    (void)tc358743_bus_ok(tc);
     while (waited < timeout_ms) {
-        uint8_t st = 0;
-        (void)tc358743_sys_status(tc, &st);
         if (tc_has_pixel_stream(tc)) {
+            uint8_t st = 0;
+            (void)tc358743_sys_status(tc, &st);
             ESP_LOGI(CAPTURE_LOG_TAG, "HDMI ready SYS_STATUS=0x%02x after %" PRIu32 " ms", st, waited);
             tc358743_debug_bridge(tc);
             return;
         }
         if (waited > 0 && (waited % 2000u) == 0u) {
-            ESP_LOGW(CAPTURE_LOG_TAG, "HDMI still unlocked after %" PRIu32 " ms (st=0x%02x)", waited, st);
+            uint8_t st = 0;
+            (void)tc358743_sys_status(tc, &st);
+            ESP_LOGW(CAPTURE_LOG_TAG, "still waiting (%" PRIu32 " ms) st=0x%02x bus_ok=%d", waited, st,
+                     (int)tc358743_bus_ok(tc));
             tc358743_debug_status(tc);
-            tc358743_debug_bridge(tc);
         }
         vTaskDelay(pdMS_TO_TICKS(step));
         waited += step;
     }
-    ESP_LOGW(CAPTURE_LOG_TAG, "HDMI lock wait %" PRIu32 " ms ended without TMDS+SYNC", timeout_ms);
+    ESP_LOGW(CAPTURE_LOG_TAG, "HDMI lock wait %" PRIu32 " ms ended without valid lock", timeout_ms);
     tc358743_debug_status(tc);
+    (void)tc358743_bus_ok(tc);
 }
 
 static void hardened_hdmi_bringup(tc358743_t *tc)
 {
     const int attempts = 4;
-    ESP_LOGI(CAPTURE_LOG_TAG, "Hardened HDMI bring-up: %d HPD/EDID cycles (UYVY path)", attempts);
+    ESP_LOGI(CAPTURE_LOG_TAG, "Hardened HDMI bring-up: %d HPD/EDID cycles", attempts);
+
+    if (!tc358743_bus_ok(tc)) {
+        ESP_LOGE(CAPTURE_LOG_TAG,
+                 "I2C register map is uniform fill BEFORE HPD — bridge not programmed. "
+                 "CSI will not receive frames until CONFCTL reads as a real value.");
+    }
 
     ESP_ERROR_CHECK(tc358743_enable_hdmi_output(tc));
 
@@ -130,7 +142,7 @@ static void hardened_hdmi_bringup(tc358743_t *tc)
             ESP_LOGI(CAPTURE_LOG_TAG, "HDMI locked on attempt %d/%d", i, attempts);
             return;
         }
-        ESP_LOGW(CAPTURE_LOG_TAG, "Attempt %d/%d: no TMDS+SYNC yet", i, attempts);
+        ESP_LOGW(CAPTURE_LOG_TAG, "Attempt %d/%d: no valid lock", i, attempts);
     }
 
     ESP_LOGW(CAPTURE_LOG_TAG, "All %d HPD/EDID attempts failed", attempts);
@@ -141,40 +153,20 @@ void capture_debug_csi_timeout(capture_ctx_t *c, unsigned bpp, size_t fb_bytes)
     const uint32_t gdma_64b = (uint32_t)(c->hres * c->vres * bpp / 64);
     uint32_t brg_fc = MIPI_CSI_BRIDGE.frame_cfg.val;
     uint32_t isp_fc = ISP.frame_cfg.val;
-    unsigned brg_has_hsync = (unsigned)((brg_fc >> 24) & 1u);
-    unsigned brg_vcheck = (unsigned)((brg_fc >> 25) & 1u);
-    unsigned isp_ls = (unsigned)((isp_fc >> 29) & 1u);
-    unsigned isp_le = (unsigned)((isp_fc >> 30) & 1u);
     ESP_LOGW(CAPTURE_LOG_TAG,
-             "CSI stall: fb=%zu B expect, GDMA size=%" PRIu32 "x64b for %ux%u@%ubpp | get_new=%" PRIu32 " done=%" PRIu32
-             " ping=%d done_fb=%p",
+             "CSI stall: fb=%zu B GDMA=%" PRIu32 "x64b %ux%u@%ubpp get_new=%" PRIu32 " done=%" PRIu32,
              fb_bytes, gdma_64b, (unsigned)c->hres, (unsigned)c->vres, bpp, c->csi_get_new_irqs,
-             c->csi_dma_done_irqs, c->ping_fb_idx, (void *)c->done_fb);
-    ESP_LOGW(CAPTURE_LOG_TAG, "  esp_cam: csi_transfer_size=%" PRIu32 "x64b; UYVY in_bpp=16 DT=0x1E", gdma_64b);
-    {
-        uint32_t dtc = MIPI_CSI_BRIDGE.data_type_cfg.val;
-        unsigned lo = (unsigned)(dtc & 0x3fu);
-        unsigned hi = (unsigned)((dtc >> 8) & 0x3fu);
-        ESP_LOGW(CAPTURE_LOG_TAG, "  BRG data_type filter min=0x%02x max=0x%02x (expect YUV422_8b=0x1E)", lo, hi);
-    }
-    ESP_LOGW(CAPTURE_LOG_TAG, "  BRG frame_cfg=0x%08" PRIx32 " (vadr=%" PRIu32 " hadr=%" PRIu32 ") host_ctrl=0x%08" PRIx32
-             " dtype_reg=0x%08" PRIx32,
-             brg_fc, brg_fc & 0xfffu, (brg_fc >> 12) & 0xfffu, MIPI_CSI_BRIDGE.host_ctrl.val, MIPI_CSI_BRIDGE.data_type_cfg.val);
-    ESP_LOGW(CAPTURE_LOG_TAG, "  BRG line packets: has_hsync=%u vadr_check=%u | ISP line packets: start=%u end=%u",
-             brg_has_hsync, brg_vcheck, isp_ls, isp_le);
-    ESP_LOGW(CAPTURE_LOG_TAG, "  BRG csi_en=0x%08" PRIx32 " buf_flow=0x%08" PRIx32, MIPI_CSI_BRIDGE.csi_en.val,
-             MIPI_CSI_BRIDGE.buf_flow_ctl.val);
-    ESP_LOGW(CAPTURE_LOG_TAG, "  ISP frame_cfg=0x%08" PRIx32 " (vadr=%" PRIu32 " hadr=%" PRIu32 ") cntl=0x%08" PRIx32, isp_fc,
-             isp_fc & 0xfffu, (isp_fc >> 12) & 0xfffu, ISP.cntl.val);
-    {
-        uint32_t bfc = MIPI_CSI_BRIDGE.buf_flow_ctl.val;
-        ESP_LOGW(CAPTURE_LOG_TAG, "  BRG buf_depth=%" PRIu32 " afull_th=%" PRIu32,
-                 (bfc >> 16) & 0x3fffu, bfc & 0x3fffu);
-    }
+             c->csi_dma_done_irqs);
+    ESP_LOGW(CAPTURE_LOG_TAG, "  BRG frame_cfg=0x%08" PRIx32 " dtype=0x%08" PRIx32 " csi_en=0x%08" PRIx32,
+             brg_fc, MIPI_CSI_BRIDGE.data_type_cfg.val, MIPI_CSI_BRIDGE.csi_en.val);
+    ESP_LOGW(CAPTURE_LOG_TAG, "  ISP frame_cfg=0x%08" PRIx32 " cntl=0x%08" PRIx32, isp_fc, ISP.cntl.val);
     if (c && c->tc) {
         tc358743_debug_status(c->tc);
-        tc358743_debug_bridge(c->tc);
-        tc358743_debug_stall_extras(c->tc);
+        (void)tc358743_bus_ok(c->tc);
+        if (tc358743_bus_ok(c->tc)) {
+            tc358743_debug_bridge(c->tc);
+            tc358743_debug_stall_extras(c->tc);
+        }
     }
 }
 
@@ -256,6 +248,12 @@ capture_ctx_t *capture_hw_init_start(void)
     ESP_ERROR_CHECK(tc358743_init_streaming(s_cap.tc));
     tc358743_set_csi_uyvy422(s_cap.tc, true);
 
+    if (!tc358743_bus_ok(s_cap.tc)) {
+        ESP_LOGE(CAPTURE_LOG_TAG,
+                 "FATAL: TC358743 register map is I2C fill after init (CONFCTL not programmed). "
+                 "Refusing to pretend HDMI is locked. Fix I2C path to the bridge.");
+    }
+
     s_cap.hres = P4KVM_CSI_H_RES;
     s_cap.vres = P4KVM_CSI_V_RES;
     s_cap.frame_bytes = (size_t)s_cap.hres * (size_t)s_cap.vres * 2u;
@@ -265,7 +263,7 @@ capture_ctx_t *capture_hw_init_start(void)
     const uint32_t caps = MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
     uint8_t *blk = heap_caps_aligned_calloc(align, CAPTURE_FB_COUNT, s_cap.frame_bytes, caps);
     if (!blk) {
-        ESP_LOGE(CAPTURE_LOG_TAG, "CSI frame buffer alloc failed (%u x %zu bytes)", CAPTURE_FB_COUNT, s_cap.frame_bytes);
+        ESP_LOGE(CAPTURE_LOG_TAG, "CSI frame buffer alloc failed");
         vTaskDelete(NULL);
         return NULL;
     }
@@ -277,7 +275,7 @@ capture_ctx_t *capture_hw_init_start(void)
     s_cap.csi_dma_done_irqs = 0;
     s_cap.csi_get_new_irqs = 0;
 
-    ESP_LOGI(CAPTURE_LOG_TAG, "CSI UYVY422 ring %u x %zu bytes (align %zu)", CAPTURE_FB_COUNT, s_cap.frame_bytes, align);
+    ESP_LOGI(CAPTURE_LOG_TAG, "CSI UYVY422 ring %u x %zu bytes", CAPTURE_FB_COUNT, s_cap.frame_bytes);
 
     s_cap.csi_done_sem = xSemaphoreCreateCounting(32, 0);
     if (!s_cap.csi_done_sem) {
@@ -326,12 +324,11 @@ capture_ctx_t *capture_hw_init_start(void)
     ISP.cntl.isp_en = 0;
     capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
 
-    /* Allocate JPEG path dependencies before long HDMI wait so HTTP is not stuck on "camera starting". */
     hardened_hdmi_bringup(s_cap.tc);
     tc358743_set_csi_uyvy422(s_cap.tc, true);
 
     if (!tc_has_pixel_stream(s_cap.tc)) {
-        ESP_LOGW(CAPTURE_LOG_TAG, "No TMDS+SYNC after bring-up — starting CSI anyway");
+        ESP_LOGW(CAPTURE_LOG_TAG, "No valid HDMI lock — starting CSI anyway (expect timeouts)");
     }
 
     capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
@@ -358,7 +355,6 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
 
     bool locked = tc_has_pixel_stream(c->tc);
     ESP_LOGW(CAPTURE_LOG_TAG, "HDMI recover (locked=%d)", (int)locked);
-    tc358743_debug_status(c->tc);
 
     if (s_cam_started) {
         esp_err_t er = esp_cam_ctlr_stop(s_cam);
@@ -373,10 +369,7 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
         tc358743_resetn_pulse();
         for (int i = 1; i <= 3; i++) {
             ESP_LOGI(CAPTURE_LOG_TAG, "Recover HPD attempt %d/3", i);
-            esp_err_t er = tc358743_hdmi_hotplug_reset(c->tc);
-            if (er != ESP_OK) {
-                ESP_LOGW(CAPTURE_LOG_TAG, "hotplug_reset: %s", esp_err_to_name(er));
-            }
+            (void)tc358743_hdmi_hotplug_reset(c->tc);
             vTaskDelay(pdMS_TO_TICKS(300));
             wait_tc358743_pixel_stream(c->tc, 5000);
             if (tc_has_pixel_stream(c->tc)) {
@@ -384,22 +377,17 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
             }
         }
     } else {
-        esp_err_t er = tc358743_reapply_csi_path_after_hdmi(c->tc);
-        if (er != ESP_OK) {
-            ESP_LOGW(CAPTURE_LOG_TAG, "reapply_csi: %s", esp_err_to_name(er));
-        }
+        (void)tc358743_reapply_csi_path_after_hdmi(c->tc);
     }
 
     if (!tc_has_pixel_stream(c->tc)) {
-        ESP_LOGW(CAPTURE_LOG_TAG, "Still no TMDS+SYNC after recover");
-        tc358743_debug_status(c->tc);
+        ESP_LOGW(CAPTURE_LOG_TAG, "Still no valid lock after recover");
         return ESP_ERR_INVALID_STATE;
     }
 
     tc358743_set_csi_uyvy422(c->tc, true);
     capture_configure_p4_csi_bridge(c->hres, c->vres);
     ISP.cntl.isp_en = 0;
-
     c->ping_fb_idx = 0;
     c->done_fb = NULL;
     c->csi_dma_done_irqs = 0;
@@ -407,10 +395,8 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
 
     esp_err_t er = esp_cam_ctlr_start(s_cam);
     if (er != ESP_OK) {
-        ESP_LOGE(CAPTURE_LOG_TAG, "esp_cam_ctlr_start after recover: %s", esp_err_to_name(er));
         return er;
     }
     s_cam_started = true;
-    ESP_LOGI(CAPTURE_LOG_TAG, "esp_cam_ctlr_start after recover (UYVY)");
     return ESP_OK;
 }
