@@ -2,13 +2,8 @@
 #pragma once
 
 #include "esp_log.h"
-#include "i2c_guard.h"
 #include "tc358743.h"
 
-/**
- * Linux SYS_STATUS bits — only meaningful if the rest of the chip is not a
- * uniform fill. Real TC358743 never has SYS==VI1==VI2==CONFCTL_lo after init.
- */
 static inline void tc358743_debug_status(tc358743_t *dev)
 {
     if (!dev) {
@@ -16,7 +11,7 @@ static inline void tc358743_debug_status(tc358743_t *dev)
     }
     uint8_t st = 0;
     if (tc358743_sys_status(dev, &st) != ESP_OK) {
-        ESP_LOGE("tc358743", "SYS_STATUS I2C read failed");
+        ESP_LOGE("tc358743", "SYS_STATUS read failed");
         return;
     }
     ESP_LOGI("tc358743",
