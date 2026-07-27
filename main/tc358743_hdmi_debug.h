@@ -8,7 +8,16 @@
  * Linux tc358743_regs.h SYS_STATUS (0x8520):
  *  bit0 DDC5V  bit1 TMDS  bit2 PHY_PLL  bit3 PHY_SCDT
  *  bit4 HDMI   bit5 HDCP  bit6 AVMUTE  bit7 SYNC
+ *
+ * If *every* register reads 0x7F/0x7F7F (and multi-byte I2C returns
+ * ESP_ERR_INVALID_RESPONSE), the bus is broken or RMW poisoned the chip.
+ * That is NOT real TMDS/HDCP — do not treat it as an HDMI handshake.
  */
+static inline bool tc358743_status_looks_like_i2c_garbage(uint8_t st)
+{
+    return st == 0x7fu || st == 0xffu;
+}
+
 static inline void tc358743_debug_status(tc358743_t *dev)
 {
     if (!dev) {
@@ -16,6 +25,7 @@ static inline void tc358743_debug_status(tc358743_t *dev)
     }
     uint8_t st = 0;
     if (tc358743_sys_status(dev, &st) != ESP_OK) {
+        ESP_LOGE("tc358743", "SYS_STATUS I2C read failed");
         return;
     }
     const int ddc = (int)(st & 1);
@@ -30,14 +40,22 @@ static inline void tc358743_debug_status(tc358743_t *dev)
              "SYS_STATUS=0x%02x DDC5V=%d TMDS=%d PLL=%d SCDT=%d HDMI=%d HDCP=%d AVMUTE=%d SYNC=%d",
              st, ddc, tmds, pll, scdt, hdmi, hdcp, avmute, sync);
 
+    if (tc358743_status_looks_like_i2c_garbage(st)) {
+        ESP_LOGE("tc358743",
+                 "SYS_STATUS 0x%02x looks like I2C garbage (all-ones pattern). "
+                 "Not a real HDMI lock. Check CSI ribbon (SDA/SCL), RESETN wiring, "
+                 "and that writes are not read-modify-write on failed reads.",
+                 st);
+        return;
+    }
+
     if (tmds && !sync) {
         if (avmute || hdcp) {
             ESP_LOGW("tc358743",
-                     "TMDS up but SYNC=0 (AVMUTE=%d HDCP=%d): source is muting/protecting — "
-                     "disable HDCP on the source or use a non-HDCP output; CSI cannot stream muted video",
+                     "TMDS up but SYNC=0 (AVMUTE=%d HDCP=%d): source mute/HDCP possible",
                      avmute, hdcp);
         } else {
-            ESP_LOGW("tc358743", "TMDS up but SYNC=0 (no AVMUTE) — waiting for stable frame sync");
+            ESP_LOGW("tc358743", "TMDS up but SYNC=0 — waiting for stable frame sync");
         }
     }
 }
