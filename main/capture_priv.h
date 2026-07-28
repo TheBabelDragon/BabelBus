@@ -18,10 +18,10 @@
 #define CAPTURE_LOG_TAG "babelbus"
 
 /*
- * Was 2 — DMA reused a buffer while JPEG still read it → quality collapsed
- * then solid fill. Four gives ~3 frame periods of headroom at 60 Hz CSI.
+ * 3 FBs: enough headroom vs JPEG latency without burning 4× max-res SPIRAM.
+ * (4 × 1080p RGB888 ≈ 25 MB and left no room for encode scratch.)
  */
-#define CAPTURE_FB_COUNT 4
+#define CAPTURE_FB_COUNT 3
 
 /** Max supported capture (buffers allocated once). */
 #define CAPTURE_MAX_H 1920u

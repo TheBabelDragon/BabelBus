@@ -2,8 +2,8 @@
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * RGB888 CSI → SPIRAM scratch copy → HW JPEG.
- * Encoding the live DMA buffer caused progressive corruption (quality blow-up).
+ * RGB888 CSI → optional SPIRAM scratch → HW JPEG.
+ * Scratch is sized to the *active* frame, not max 1080p (that OOMed at 6.2 MB).
  */
 #include "capture_priv.h"
 
@@ -28,6 +28,7 @@
 
 static jpeg_encoder_handle_t s_jpeg_enc;
 static uint8_t *s_encode_scratch;
+static size_t s_encode_scratch_bytes;
 
 #ifndef BABELBUS_TARGET_FPS
 #define BABELBUS_TARGET_FPS 25
@@ -47,13 +48,39 @@ static bool frame_looks_blank_fill(const uint8_t *p, size_t nbytes)
     for (size_t i = 0; i < 128 && (mid + i) < nbytes; i++) {
         sum += p[mid + i];
     }
-    /* 256 * 0x80 = 32768; allow small noise band */
     return (sum > 32000u && sum < 33536u);
+}
+
+/** Grow/shrink scratch to match active frame. Never fatal. */
+static void encode_scratch_ensure(size_t need)
+{
+    if (need == 0) {
+        return;
+    }
+    if (s_encode_scratch && s_encode_scratch_bytes >= need) {
+        return;
+    }
+    if (s_encode_scratch) {
+        heap_caps_free(s_encode_scratch);
+        s_encode_scratch = NULL;
+        s_encode_scratch_bytes = 0;
+    }
+    s_encode_scratch = heap_caps_aligned_alloc(64, need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_encode_scratch) {
+        s_encode_scratch = heap_caps_aligned_alloc(64, need, MALLOC_CAP_DEFAULT);
+    }
+    if (s_encode_scratch) {
+        s_encode_scratch_bytes = need;
+        ESP_LOGI(CAPTURE_LOG_TAG, "encode scratch %zu bytes", need);
+    } else {
+        ESP_LOGW(CAPTURE_LOG_TAG,
+                 "encode scratch alloc failed (%zu) — encoding DMA buffer in place",
+                 need);
+    }
 }
 
 void capture_mjpeg_run(capture_ctx_t *c)
 {
-    /* 100ms was too short for 1080p → silent failures → frozen then grey. */
     jpeg_encode_engine_cfg_t jcfg = {.intr_priority = 0, .timeout_ms = 400};
     ESP_ERROR_CHECK(jpeg_new_encoder_engine(&jcfg, &s_jpeg_enc));
 
@@ -93,17 +120,12 @@ void capture_mjpeg_run(capture_ctx_t *c)
         return;
     }
 
-    /* DMA-safe encode source: never JPEG the live CSI buffer in place. */
-    s_encode_scratch = heap_caps_aligned_alloc(64, c->fb_alloc_bytes,
-                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_encode_scratch) {
-        ESP_LOGE(CAPTURE_LOG_TAG, "encode scratch alloc failed (%zu)", c->fb_alloc_bytes);
-        vTaskDelete(NULL);
-        return;
-    }
+    /* Active-frame scratch only (720×480 ≈ 1 MB; not 6.2 MB max). */
+    encode_scratch_ensure(c->frame_bytes);
 
-    ESP_LOGI(CAPTURE_LOG_TAG, "MJPEG ready q=%u fps=%d scratch=%zu (DMA-safe)",
-             (unsigned)g_jpeg_frame.jpeg_quality, BABELBUS_TARGET_FPS, c->fb_alloc_bytes);
+    ESP_LOGI(CAPTURE_LOG_TAG, "MJPEG ready q=%u fps=%d frame=%zu scratch=%s",
+             (unsigned)g_jpeg_frame.jpeg_quality, BABELBUS_TARGET_FPS, c->frame_bytes,
+             s_encode_scratch ? "ok" : "inplace");
 
     const unsigned bpp = capture_csi_bpp();
     int64_t hdmi_recover_cooldown_until_us = 0;
@@ -122,6 +144,8 @@ void capture_mjpeg_run(capture_ctx_t *c)
             if (now >= hdmi_recover_cooldown_until_us) {
                 (void)capture_hw_hdmi_recover(c);
                 hdmi_recover_cooldown_until_us = now + (int64_t)4 * 1000000;
+                /* Resolution may have changed during recover. */
+                encode_scratch_ensure(c->frame_bytes);
             }
             continue;
         }
@@ -160,11 +184,18 @@ void capture_mjpeg_run(capture_ctx_t *c)
         }
 
         (void)esp_cache_msync(src, nbytes, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
-        memcpy(s_encode_scratch, src, nbytes);
 
-        if (frame_looks_blank_fill(s_encode_scratch, nbytes)) {
+        const uint8_t *enc_src;
+        if (s_encode_scratch && s_encode_scratch_bytes >= nbytes) {
+            memcpy(s_encode_scratch, src, nbytes);
+            enc_src = s_encode_scratch;
+        } else {
+            enc_src = (const uint8_t *)src;
+        }
+
+        if (frame_looks_blank_fill(enc_src, nbytes)) {
             if ((c->csi_dma_done_irqs - last_logged_done) >= 150u) {
-                ESP_LOGW(CAPTURE_LOG_TAG, "skip blank CSI fill done=%lu (not promoting to stream)",
+                ESP_LOGW(CAPTURE_LOG_TAG, "skip blank CSI fill done=%lu",
                          (unsigned long)c->csi_dma_done_irqs);
                 last_logged_done = c->csi_dma_done_irqs;
             }
@@ -173,14 +204,13 @@ void capture_mjpeg_run(capture_ctx_t *c)
 
         if (c->csi_dma_done_irqs == 1 ||
             (c->csi_dma_done_irqs - last_logged_done) >= 300u) {
-            const uint8_t *p = s_encode_scratch;
             uint32_t sum = 0;
             size_t mid = nbytes / 2u;
             for (size_t i = 0; i < 128 && i < nbytes; i++) {
-                sum += p[i];
+                sum += enc_src[i];
             }
             for (size_t i = 0; i < 128 && (mid + i) < nbytes; i++) {
-                sum += p[mid + i];
+                sum += enc_src[mid + i];
             }
             ESP_LOGI(CAPTURE_LOG_TAG, "frame ok done=%lu jpeg_seq=%lu %ux%u pixsum256=%lu",
                      (unsigned long)c->csi_dma_done_irqs, (unsigned long)g_jpeg_frame.frame_seq,
@@ -204,7 +234,7 @@ void capture_mjpeg_run(capture_ctx_t *c)
             .pixel_reverse = false,
         };
         uint32_t out_sz = 0;
-        esp_err_t er = jpeg_encoder_process(s_jpeg_enc, &enc, s_encode_scratch, (uint32_t)nbytes,
+        esp_err_t er = jpeg_encoder_process(s_jpeg_enc, &enc, (uint8_t *)enc_src, (uint32_t)nbytes,
                                             g_jpeg_frame.jpeg_buf[back], (uint32_t)g_jpeg_frame.jpeg_cap,
                                             &out_sz);
         if (er != ESP_OK || out_sz == 0 || out_sz > g_jpeg_frame.jpeg_cap) {
