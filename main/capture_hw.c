@@ -3,10 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Recover policy:
- *   1) soft_kick (VBUFEN pulse + AUTO_MUTE stream-on)
- *   2) CTXRST rearm (no HPD, cam stays running)
- *   3) After streak >= 3 with zero frames: full HPD even if SYS_STATUS still "locked"
- *      (TxAct=0 with TMDS lock is a dead CSI TX — soft path cannot fix it).
+ *   1) soft_kick
+ *   2) CTXRST rearm (no HPD)
+ *   3) After streak >= 3 with zero frames: full HPD even if SYS_STATUS locked
  */
 #include "capture_priv.h"
 
@@ -180,7 +179,7 @@ static void after_hdmi_lock(tc358743_t *tc)
     }
     tc358743_set_csi_uyvy422(tc, false);
     (void)tc358743_reapply_csi_path_after_hdmi(tc);
-    ESP_LOGI(CAPTURE_LOG_TAG, "CSI path reapplied after HDMI lock (RGB888 AUTO_MUTE non-cont)");
+    ESP_LOGI(CAPTURE_LOG_TAG, "CSI path reapplied after HDMI lock");
 }
 
 static void drain_done_sem(capture_ctx_t *c)
@@ -259,6 +258,13 @@ static bool IRAM_ATTR cam_on_done(esp_cam_ctlr_handle_t h, esp_cam_ctlr_trans_t 
     (void)__sync_add_and_fetch(&c->csi_dma_done_irqs, 1);
     if (trans && trans->buffer) {
         c->done_fb = trans->buffer;
+        /* Map pointer back to index for diagnostics */
+        for (int i = 0; i < CAPTURE_FB_COUNT; i++) {
+            if (c->fb[i] == trans->buffer) {
+                c->done_fb_idx = i;
+                break;
+            }
+        }
     }
     BaseType_t woken = pdFALSE;
     if (c->csi_done_sem) {
@@ -346,11 +352,11 @@ static esp_err_t recreate_csi_at_size(capture_ctx_t *c, uint32_t hres, uint32_t 
     s_isp_created = true;
     ISP.cntl.isp_en = 0;
     capture_configure_p4_csi_bridge(hres, vres);
-    ESP_LOGI(CAPTURE_LOG_TAG, "CSI recreated at %ux%u", (unsigned)hres, (unsigned)vres);
+    ESP_LOGI(CAPTURE_LOG_TAG, "CSI recreated at %ux%u (fb=%d)", (unsigned)hres, (unsigned)vres,
+             CAPTURE_FB_COUNT);
     return ESP_OK;
 }
 
-/** Wait up to ~1s for dma_done to advance. */
 static bool wait_new_frames(capture_ctx_t *c, uint32_t done_before, int loops)
 {
     for (int i = 0; i < loops; i++) {
@@ -362,7 +368,6 @@ static bool wait_new_frames(capture_ctx_t *c, uint32_t done_before, int loops)
     return false;
 }
 
-/** Returns ESP_OK on recovery, ESP_ERR_TIMEOUT if still stuck (caller may HPD). */
 static esp_err_t soft_or_rearm_while_locked(capture_ctx_t *c)
 {
     uint32_t done_before = c->csi_dma_done_irqs;
@@ -413,6 +418,7 @@ static esp_err_t hard_hpd_recover(capture_ctx_t *c)
     drain_done_sem(c);
     c->ping_fb_idx = 0;
     c->done_fb = NULL;
+    c->done_fb_idx = -1;
 
     (void)tc358743_hdmi_hotplug_reset(c->tc);
     wait_hdmi_lock(c->tc, 5000);
@@ -478,7 +484,6 @@ capture_ctx_t *capture_hw_init_start(void)
         .glitch_ignore_cnt = 7,
         .intr_priority = 0,
         .trans_queue_depth = 0,
-        /* Match p4kvm: many FPC / adapter combos need internal pull-ups. */
         .flags = {.enable_internal_pullup = true},
     };
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus));
@@ -527,7 +532,8 @@ capture_ctx_t *capture_hw_init_start(void)
     uint8_t *blk = heap_caps_aligned_calloc(align, CAPTURE_FB_COUNT, s_cap.fb_alloc_bytes,
                                             MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!blk) {
-        ESP_LOGE(CAPTURE_LOG_TAG, "FB alloc fail (max %ux%u RGB888)", CAPTURE_MAX_H, CAPTURE_MAX_V);
+        ESP_LOGE(CAPTURE_LOG_TAG, "FB alloc fail (max %ux%u RGB888 x%d)", CAPTURE_MAX_H, CAPTURE_MAX_V,
+                 CAPTURE_FB_COUNT);
         vTaskDelete(NULL);
         return NULL;
     }
@@ -536,6 +542,7 @@ capture_ctx_t *capture_hw_init_start(void)
     }
     s_cap.ping_fb_idx = 0;
     s_cap.done_fb = NULL;
+    s_cap.done_fb_idx = -1;
     s_cap.csi_dma_done_irqs = 0;
     s_cap.csi_get_new_irqs = 0;
     s_cap.csi_done_sem = xSemaphoreCreateCounting(64, 0);
@@ -544,8 +551,9 @@ capture_ctx_t *capture_hw_init_start(void)
         return NULL;
     }
 
-    ESP_LOGI(CAPTURE_LOG_TAG, "MIPI lane %u Mbps RGB888 DT=0x24 active=%ux%u",
-             (unsigned)P4KVM_MIPI_LANE_MBPS, (unsigned)s_cap.hres, (unsigned)s_cap.vres);
+    ESP_LOGI(CAPTURE_LOG_TAG, "MIPI lane %u Mbps RGB888 DT=0x24 active=%ux%u fb=%d",
+             (unsigned)P4KVM_MIPI_LANE_MBPS, (unsigned)s_cap.hres, (unsigned)s_cap.vres,
+             CAPTURE_FB_COUNT);
 
     esp_cam_ctlr_csi_config_t csi_cfg = {
         .ctlr_id = 0,
@@ -586,7 +594,6 @@ capture_ctx_t *capture_hw_init_start(void)
     ISP.cntl.isp_en = 0;
     capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
 
-    /* Cam RX up, then re-assert bridge TX (p4kvm order after lock). */
     ESP_ERROR_CHECK(esp_cam_ctlr_start(s_cam));
     s_cam_started = true;
     tc358743_set_csi_uyvy422(s_cap.tc, false);
@@ -609,7 +616,6 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
         if (soft == ESP_OK) {
             return ESP_OK;
         }
-        /* Locked in SYS_STATUS but no CSI frames after several tries → HPD. */
         if (s_soft_fail_streak >= SOFT_FAIL_BEFORE_HPD) {
             ESP_LOGW(CAPTURE_LOG_TAG,
                      "streak=%d with zero frames despite lock — forcing HPD",
