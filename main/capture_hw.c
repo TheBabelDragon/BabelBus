@@ -3,7 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Waveshare ESP32-P4-WIFI6-DEV-KIT Rev 1.1 + Waveshare HDMI to CSI Adapter
- * RGB888 CSI (DT 0x24). Soft recover restarts cam without HPD when locked.
+ * RGB888 CSI (DT 0x24).
+ * Stall while HDMI locked → CTXRST rearm (no HPD). HPD only if unlocked.
  */
 #include "capture_priv.h"
 
@@ -48,7 +49,8 @@ static const uint32_t s_csi_expected_dt = 0x24u;
 static capture_ctx_t s_cap;
 static uint32_t s_cam_h;
 static uint32_t s_cam_v;
-static int s_soft_fail_streak;
+static int s_rearm_fail_streak;
+static int64_t s_last_hpd_us;
 
 static void tc358743_resetn_pulse(void)
 {
@@ -346,8 +348,8 @@ static esp_err_t recreate_csi_at_size(capture_ctx_t *c, uint32_t hres, uint32_t 
     return ESP_OK;
 }
 
-/** Stop cam → soft_kick bridge → start cam. No HPD. */
-static esp_err_t soft_restart_stream(capture_ctx_t *c)
+/** Cam stop → CTXRST rearm bridge → cam start. No HPD. */
+static esp_err_t rearm_stream(capture_ctx_t *c)
 {
     uint32_t done_before = c->csi_dma_done_irqs;
 
@@ -359,29 +361,33 @@ static esp_err_t soft_restart_stream(capture_ctx_t *c)
     c->ping_fb_idx = 0;
     c->done_fb = NULL;
 
-    (void)tc358743_soft_kick(c->tc);
+    (void)tc358743_csi_rearm(c->tc);
     ISP.cntl.isp_en = 0;
     MIPI_CSI_BRIDGE.int_clr.val = 0x3fu;
     capture_configure_p4_csi_bridge(c->hres, c->vres);
 
+    vTaskDelay(pdMS_TO_TICKS(20));
+
     esp_err_t er = esp_cam_ctlr_start(s_cam);
     if (er != ESP_OK) {
-        ESP_LOGE(CAPTURE_LOG_TAG, "soft restart cam start failed %s", esp_err_to_name(er));
+        ESP_LOGE(CAPTURE_LOG_TAG, "rearm cam start failed %s", esp_err_to_name(er));
         return er;
     }
     s_cam_started = true;
     (void)tc358743_set_streaming(c->tc, true);
 
-    /* Brief wait: if done advances, soft worked. */
-    vTaskDelay(pdMS_TO_TICKS(200));
-    if (c->csi_dma_done_irqs > done_before) {
-        s_soft_fail_streak = 0;
-        ESP_LOGI(CAPTURE_LOG_TAG, "soft restart OK done %" PRIu32 "→%" PRIu32, done_before,
-                 c->csi_dma_done_irqs);
-        return ESP_OK;
+    /* Wait for real frames. */
+    for (int i = 0; i < 15; i++) {
+        vTaskDelay(pdMS_TO_TICKS(40));
+        if (c->csi_dma_done_irqs > done_before) {
+            s_rearm_fail_streak = 0;
+            ESP_LOGI(CAPTURE_LOG_TAG, "rearm OK done %" PRIu32 "→%" PRIu32, done_before,
+                     c->csi_dma_done_irqs);
+            return ESP_OK;
+        }
     }
-    s_soft_fail_streak++;
-    ESP_LOGW(CAPTURE_LOG_TAG, "soft restart no new frames (streak=%d)", s_soft_fail_streak);
+    s_rearm_fail_streak++;
+    ESP_LOGW(CAPTURE_LOG_TAG, "rearm no new frames (streak=%d)", s_rearm_fail_streak);
     return ESP_ERR_TIMEOUT;
 }
 
@@ -530,17 +536,28 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
 {
     ESP_RETURN_ON_FALSE(c && c->tc, ESP_ERR_INVALID_ARG, CAPTURE_LOG_TAG, "ctx");
 
-    /* Soft path while HDMI locked: cam stop/start + bridge kick, no HPD. */
-    if (tc_locked(c->tc) && s_soft_fail_streak < 4) {
-        ESP_LOGW(CAPTURE_LOG_TAG, "CSI soft recover (locked) streak=%d", s_soft_fail_streak);
-        if (soft_restart_stream(c) == ESP_OK) {
+    /* While HDMI still locked: full CSI TX rearm (CTXRST) — never HPD. */
+    if (tc_locked(c->tc)) {
+        ESP_LOGW(CAPTURE_LOG_TAG, "CSI rearm (locked, no HPD) streak=%d", s_rearm_fail_streak);
+        if (rearm_stream(c) == ESP_OK) {
             return ESP_OK;
         }
-        /* fall through to hard if soft did not produce frames */
+        /* Stay locked but TX dead — try rearm again later; HPD only if unlocked. */
+        if (s_rearm_fail_streak < 6) {
+            return ESP_ERR_TIMEOUT;
+        }
     }
 
-    s_soft_fail_streak = 0;
-    ESP_LOGW(CAPTURE_LOG_TAG, "CSI hard recover: cam stop → HPD → CSI → start");
+    /* Rate-limit HPD: at most once per 8s. */
+    int64_t now = (int64_t)esp_timer_get_time();
+    if ((now - s_last_hpd_us) < (int64_t)8 * 1000000) {
+        ESP_LOGW(CAPTURE_LOG_TAG, "HPD rate-limited — retry rearm only");
+        return rearm_stream(c);
+    }
+    s_last_hpd_us = now;
+    s_rearm_fail_streak = 0;
+
+    ESP_LOGW(CAPTURE_LOG_TAG, "CSI hard recover: HPD (unlocked or rearm exhausted)");
 
     if (s_cam_started && s_cam) {
         (void)esp_cam_ctlr_stop(s_cam);
