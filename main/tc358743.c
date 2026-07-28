@@ -2,8 +2,8 @@
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * Colorbar (YFmt=2) stopped MIPI HS on this board — leave RGB (YFmt=0).
  * Continuous clock required for dma_done on Waveshare P4 + adapter.
+ * When TxAct drops while HDMI locked, rearm with CTXRST — do not HPD.
  */
 #include "tc358743.h"
 
@@ -338,7 +338,9 @@ static void sleep_mode(tc358743_t *d, bool enable)
 
 static void csi_kick_start(tc358743_t *d)
 {
+    /* LP11 → continuous HS: required for P4 continuous-clock RX. */
     wr32(d, TXOPTIONCNTRL, 0);
+    vTaskDelay(pdMS_TO_TICKS(1));
     wr32(d, CSI_START, MASK_STRT);
     wr32(d, TXOPTIONCNTRL, MASK_CONTCLKMODE);
     wr32(d, CSI_START, MASK_STRT);
@@ -529,21 +531,12 @@ static void set_csi_lanes(tc358743_t *d, unsigned lanes)
 {
     tc358743_cfg_t *pdata = &d->cfg;
     reset_blocks(d, MASK_CTXRST);
-    if (lanes < 1) {
-        wr32(d, CLW_CNTRL, MASK_CLW_LANEDISABLE);
-    }
-    if (lanes < 1) {
-        wr32(d, D0W_CNTRL, MASK_D0W_LANEDISABLE);
-    }
-    if (lanes < 2) {
-        wr32(d, D1W_CNTRL, MASK_D1W_LANEDISABLE);
-    }
-    if (lanes < 3) {
-        wr32(d, D2W_CNTRL, MASK_D2W_LANEDISABLE);
-    }
-    if (lanes < 4) {
-        wr32(d, D3W_CNTRL, MASK_D3W_LANEDISABLE);
-    }
+    vTaskDelay(pdMS_TO_TICKS(2));
+    wr32(d, CLW_CNTRL, (lanes < 1) ? MASK_CLW_LANEDISABLE : 0);
+    wr32(d, D0W_CNTRL, (lanes < 1) ? MASK_D0W_LANEDISABLE : 0);
+    wr32(d, D1W_CNTRL, (lanes < 2) ? MASK_D1W_LANEDISABLE : 0);
+    wr32(d, D2W_CNTRL, (lanes < 3) ? MASK_D2W_LANEDISABLE : 0);
+    wr32(d, D3W_CNTRL, (lanes < 4) ? MASK_D3W_LANEDISABLE : 0);
     wr32(d, LINEINITCNT, pdata->lineinitcnt);
     wr32(d, LPTXTIMECNT, pdata->lptxtimecnt);
     wr32(d, TCLK_HEADERCNT, pdata->tclk_headercnt);
@@ -592,6 +585,7 @@ static void csi_path_arm(tc358743_t *d)
     apply_csi_color_space(d);
     enable_stream(d, true);
     wr8(d, VI_MUTE, 0);
+    vTaskDelay(pdMS_TO_TICKS(5));
     csi_kick_start(d);
     uint16_t conf = rd16(d, CONFCTL);
     ESP_LOGI(TAG, "CSI armed CONFCTL=0x%04x VBUFEN=%u YFmt=%u",
@@ -686,7 +680,7 @@ esp_err_t tc358743_hdmi_hotplug_reset(tc358743_t *d)
     ESP_LOGI(TAG, "HDMI hotplug reset");
     enable_stream(d, false);
     hpd_set(d, false);
-    vTaskDelay(pdMS_TO_TICKS(150));
+    vTaskDelay(pdMS_TO_TICKS(200));
     return tc358743_enable_hdmi_output(d);
 }
 
@@ -697,7 +691,6 @@ esp_err_t tc358743_reapply_csi_path_after_hdmi(tc358743_t *d)
     return ESP_OK;
 }
 
-/** Soft kick only — no CTXRST / HPD. Use when HDMI still locked. */
 esp_err_t tc358743_soft_kick(tc358743_t *d)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
@@ -705,6 +698,14 @@ esp_err_t tc358743_soft_kick(tc358743_t *d)
     enable_stream(d, true);
     wr8(d, VI_MUTE, 0);
     csi_kick_start(d);
+    return ESP_OK;
+}
+
+esp_err_t tc358743_csi_rearm(tc358743_t *d)
+{
+    ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
+    ESP_LOGI(TAG, "CSI rearm (CTXRST, no HPD)");
+    csi_path_arm(d);
     return ESP_OK;
 }
 
