@@ -1,30 +1,32 @@
-# p4kvm alignment (must match jrowny/p4kvm)
+# p4kvm alignment (must match jrowny/p4kvm + Linux)
 
-## Root cause of solid green/grey with dma_done climbing
+## Root cause of TxAct=0 / dma_done_irqs=0 while HDMI locked
 
-`pixsum256=32768` means every sampled byte is `0x80`.
-CSI is delivering *frames*, but the video payload is blank fill — not real HDMI pixels.
+SYS_STATUS shows TMDS+SCDT+SYNC, but CSI_STATUS has TxAct=0 RxAct=0 and the
+P4 CSI receiver never completes a frame.
 
-BabelBus had diverged from the working p4kvm bridge control:
+BabelBus had diverged from the working path:
 
-| Item | p4kvm (works) | BabelBus (broken) |
-|------|---------------|-------------------|
+| Item | p4kvm / Linux (works) | BabelBus (broken) |
+|------|----------------------|-------------------|
 | TXOPTIONCNTRL | **0** (non-continuous) | forced CONTCLKMODE=1 |
-| VI_MUTE on stream | **0xc0** (AUTO_MUTE) | 0 |
+| VI_MUTE on stream | **0xc0** (AUTO_MUTE) | 0x00 |
 | enable sequence | stream → HPD → CSI_START | continuous-clock kicks |
 | reapply | color → lanes → STRT | CTXRST + CONTCLK kick |
 
-## Required behavior (copy of p4kvm)
+## Required behavior
 
 ```c
 enable:  VI_MUTE = MASK_AUTO_MUTE (0xc0)
 disable: VI_MUTE = MASK_AUTO_MUTE | MASK_VI_MUTE
 TXOPTIONCNTRL = 0 always (non-continuous)
-CSI_START = MASK_STRT after enable / reapply
-NO continuous-clock LP11→HS toggle
+CSI_START = MASK_STRT after enable / reapply / soft_kick
+NO permanent continuous-clock mode
 ```
 
-## Not a resolution problem
+Linux briefly toggles CONTCLK during enable for LP11→HS on some platforms;
+on ESP32-P4 + these adapters the stable path is pure non-continuous as in p4kvm.
 
-720x480 is the DVD source. p4kvm uses fixed CSI size from menuconfig;
-BabelBus tracks HAct/VAct. Neither is "narrowing on purpose."
+## DVI sources (HDMI bit = 0 in SYS_STATUS)
+
+Set VI_MODE RGB_DVI when not HDMI. DVD players often present as DVI 720x480.
