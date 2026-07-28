@@ -54,8 +54,9 @@ esp_err_t tc358743_hdmi_hotplug_reset(tc358743_t *dev);
 esp_err_t tc358743_reapply_csi_path_after_hdmi(tc358743_t *dev);
 esp_err_t tc358743_soft_kick(tc358743_t *dev);
 esp_err_t tc358743_csi_rearm(tc358743_t *dev);
-/** Re-assert continuous clock + VBUFEN without CTXRST/HPD (periodic keep-alive). */
 esp_err_t tc358743_csi_keepalive(tc358743_t *dev);
+/** After P4 CSI RX is started: clock kick + VBUFEN + CSI_START (no HPD/CTXRST). */
+esp_err_t tc358743_arm_csi_tx(tc358743_t *dev);
 void tc358743_debug_bridge(tc358743_t *dev);
 void tc358743_debug_stall_extras(tc358743_t *dev);
 void tc358743_log_link_state(tc358743_t *dev);
