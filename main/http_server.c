@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -39,6 +40,8 @@ static void stream_release_slot_ref(int slot)
 #define STREAM_WORKER_PRIO (tskIDLE_PRIORITY + 7)
 #define AUDIO_WORKER_STACK (8 * 1024)
 #define AUDIO_CHUNK 2048
+/* Scratch for one JPEG so encoder slots free during TCP send. */
+#define STREAM_COPY_CAP (512 * 1024)
 
 extern const char index_html_start[] asm("_binary_index_html_start");
 extern const char index_html_end[] asm("_binary_index_html_end");
@@ -51,7 +54,6 @@ static esp_err_t root_get(httpd_req_t *req)
     return httpd_resp_send(req, index_html_start, len);
 }
 
-/** GET /jpeg-quality optional query `q=1..100` sets quality; response body is current quality. */
 static esp_err_t jpeg_quality_get(httpd_req_t *req)
 {
     char query[96];
@@ -102,6 +104,17 @@ static void stream_worker_task(void *arg)
 {
     httpd_req_t *req = (httpd_req_t *)arg;
     char hdr[96];
+    uint8_t *copy = heap_caps_malloc(STREAM_COPY_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!copy) {
+        copy = heap_caps_malloc(STREAM_COPY_CAP, MALLOC_CAP_DEFAULT);
+    }
+    if (!copy) {
+        ESP_LOGE(TAG, "stream copy buf alloc failed");
+        (void)httpd_resp_sendstr_chunk(req, NULL);
+        (void)httpd_req_async_handler_complete(req);
+        vTaskDelete(NULL);
+        return;
+    }
 
     jpeg_frame_stream_enter();
     uint32_t last_seq = g_jpeg_frame.frame_seq;
@@ -121,7 +134,7 @@ static void stream_worker_task(void *arg)
                 }
                 continue;
             }
-            if (xSemaphoreTake(g_jpeg_frame.frame_ready_sem, pdMS_TO_TICKS(300)) != pdTRUE) {
+            if (xSemaphoreTake(g_jpeg_frame.frame_ready_sem, pdMS_TO_TICKS(200)) != pdTRUE) {
                 if (stream_peer_disconnected(req)) {
                     stop = true;
                     break;
@@ -135,33 +148,23 @@ static void stream_worker_task(void *arg)
             break;
         }
 
-        if (xSemaphoreTake(g_jpeg_frame.xmit_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
-            if (stream_peer_disconnected(req)) {
-                break;
-            }
-            continue;
-        }
         size_t copy_len = 0;
         uint32_t seq_snap = last_seq;
-        int slot = -1;
-        if (xSemaphoreTake(g_jpeg_frame.mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
-            xSemaphoreGive(g_jpeg_frame.xmit_mutex);
+        if (xSemaphoreTake(g_jpeg_frame.mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
             continue;
         }
         int f = g_jpeg_frame.front_idx;
         seq_snap = g_jpeg_frame.frame_seq;
         if (f >= 0 && f < JPEG_SLOT_COUNT && g_jpeg_frame.jpeg_buf[f]) {
-            copy_len = g_jpeg_frame.jpeg_len[f];
-            if (copy_len > 0 && copy_len <= g_jpeg_frame.jpeg_cap) {
-                slot = f;
-                g_jpeg_frame.slot_ref[slot]++;
-            } else {
-                copy_len = 0;
+            size_t n = g_jpeg_frame.jpeg_len[f];
+            if (n > 0 && n <= g_jpeg_frame.jpeg_cap && n <= STREAM_COPY_CAP) {
+                memcpy(copy, g_jpeg_frame.jpeg_buf[f], n);
+                copy_len = n;
             }
         }
         xSemaphoreGive(g_jpeg_frame.mutex);
-        if (copy_len == 0 || slot < 0) {
-            xSemaphoreGive(g_jpeg_frame.xmit_mutex);
+
+        if (copy_len == 0) {
             last_seq = seq_snap;
             continue;
         }
@@ -173,35 +176,30 @@ static void stream_worker_task(void *arg)
                           "\r\n",
                           copy_len);
         if (hl <= 0 || hl >= (int)sizeof(hdr)) {
-            stream_release_slot_ref(slot);
-            xSemaphoreGive(g_jpeg_frame.xmit_mutex);
             last_seq = seq_snap;
             continue;
         }
 
         if (stream_peer_disconnected(req)) {
-            stream_release_slot_ref(slot);
-            xSemaphoreGive(g_jpeg_frame.xmit_mutex);
             break;
         }
 
+        /* Send from private copy — encoder never blocked by TCP. */
         esp_err_t se = httpd_resp_send_chunk(req, hdr, hl);
         if (se == ESP_OK) {
-            se = httpd_resp_send_chunk(req, (const char *)g_jpeg_frame.jpeg_buf[slot], copy_len);
+            se = httpd_resp_send_chunk(req, (const char *)copy, copy_len);
         }
         if (se == ESP_OK) {
             se = httpd_resp_send_chunk(req, "\r\n", 2);
         }
-        stream_release_slot_ref(slot);
-        xSemaphoreGive(g_jpeg_frame.xmit_mutex);
-
         if (se != ESP_OK) {
-            /* Browser refresh → ECONNRESET; expected, not an error. */
-            break;
+            break; /* refresh/close — expected */
         }
         last_seq = seq_snap;
     }
+
     jpeg_frame_stream_leave();
+    free(copy);
     (void)httpd_resp_sendstr_chunk(req, NULL);
     (void)httpd_req_async_handler_complete(req);
     vTaskDelete(NULL);
@@ -212,6 +210,10 @@ static esp_err_t stream_get(httpd_req_t *req)
     if (!g_jpeg_frame.jpeg_buf[0] || !g_jpeg_frame.jpeg_buf[1] || !g_jpeg_frame.jpeg_buf[2] ||
         !g_jpeg_frame.xmit_mutex || !g_jpeg_frame.frame_ready_sem) {
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "camera starting");
+    }
+    /* One live viewer — extra tabs get 503 instead of socket spam. */
+    if (jpeg_frame_stream_client_count() >= 1) {
+        return httpd_resp_send_custom_err(req, "503 Service Unavailable", "stream already open");
     }
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
     httpd_resp_set_hdr(req, "Pragma", "no-cache");
@@ -226,7 +228,6 @@ static esp_err_t stream_get(httpd_req_t *req)
     httpd_req_t *async_req = NULL;
     res = httpd_req_async_handler_begin(req, &async_req);
     if (res != ESP_OK) {
-        ESP_LOGW(TAG, "stream async begin: %s", esp_err_to_name(res));
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "stream busy");
     }
 
@@ -290,12 +291,12 @@ httpd_handle_t http_server_start(void)
     cfg.server_port = 80;
     cfg.stack_size = 16 * 1024;
     cfg.task_priority = tskIDLE_PRIORITY + 6;
-    cfg.send_wait_timeout = 5;
-    cfg.recv_wait_timeout = 5;
+    cfg.send_wait_timeout = 3;
+    cfg.recv_wait_timeout = 3;
     cfg.keep_alive_enable = false;
     cfg.uri_match_fn = httpd_uri_match_wildcard;
     cfg.lru_purge_enable = true;
-    cfg.max_open_sockets = 8;
+    cfg.max_open_sockets = 6;
     cfg.max_uri_handlers = 12;
 
     httpd_handle_t h = NULL;
