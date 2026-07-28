@@ -2,8 +2,8 @@
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * Recover = boot path only (full HPD + cam restart).
- * soft_kick / CTXRST-without-HPD never cleared TxAct=0 / blank fill in the field.
+ * Order that works on Waveshare P4: start CSI RX, then arm bridge TX.
+ * TxAct=0 with HDMI locked = RX up before TX was forced.
  */
 #include "capture_priv.h"
 
@@ -194,6 +194,30 @@ static void capture_configure_p4_csi_bridge(uint32_t hres, uint32_t vres)
     MIPI_CSI_BRIDGE.int_clr.val = 0x3fu;
 }
 
+/** RX is running — force bridge TX and wait briefly for dma_done. */
+static bool arm_tx_and_wait_frames(capture_ctx_t *c, int wait_ms)
+{
+    uint32_t before = c->csi_dma_done_irqs;
+    (void)tc358743_arm_csi_tx(c->tc);
+    capture_configure_p4_csi_bridge(c->hres, c->vres);
+    int waited = 0;
+    while (waited < wait_ms) {
+        if (c->csi_dma_done_irqs > before) {
+            ESP_LOGI(CAPTURE_LOG_TAG, "first DMA frame after %d ms (done=%" PRIu32 ")",
+                     waited, c->csi_dma_done_irqs);
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+        waited += 50;
+        if ((waited % 400) == 0) {
+            (void)tc358743_arm_csi_tx(c->tc);
+        }
+    }
+    ESP_LOGW(CAPTURE_LOG_TAG, "no DMA after %d ms (done=%" PRIu32 ")",
+             wait_ms, c->csi_dma_done_irqs);
+    return false;
+}
+
 void capture_debug_csi_timeout(capture_ctx_t *c, unsigned bpp, size_t fb_bytes)
 {
     ESP_LOGW(CAPTURE_LOG_TAG, "CSI stall done=%" PRIu32 " get_new=%" PRIu32 " fb=%zu bpp=%u",
@@ -350,12 +374,12 @@ static esp_err_t recreate_csi_at_size(capture_ctx_t *c, uint32_t hres, uint32_t 
     return ESP_OK;
 }
 
-/** Full boot-equivalent recover. Rate-limited to avoid HPD storms. */
 static esp_err_t hard_hpd_recover(capture_ctx_t *c)
 {
     int64_t now = (int64_t)esp_timer_get_time();
     if ((now - s_last_hpd_us) < (int64_t)5 * 1000000) {
-        ESP_LOGW(CAPTURE_LOG_TAG, "HPD rate-limited (<5s)");
+        ESP_LOGW(CAPTURE_LOG_TAG, "HPD rate-limited (<5s) — arm TX only");
+        (void)arm_tx_and_wait_frames(c, 800);
         return ESP_ERR_INVALID_STATE;
     }
     s_last_hpd_us = now;
@@ -376,7 +400,7 @@ static esp_err_t hard_hpd_recover(capture_ctx_t *c)
 
     if (!tc_locked(c->tc)) {
         ESP_LOGW(CAPTURE_LOG_TAG, "recover: still unlocked after HPD");
-        (void)tc358743_set_streaming(c->tc, true);
+        (void)tc358743_arm_csi_tx(c->tc);
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -408,8 +432,8 @@ static esp_err_t hard_hpd_recover(capture_ctx_t *c)
     }
     s_cam_started = true;
 
-    after_hdmi_lock(c->tc);
-    (void)tc358743_set_streaming(c->tc, true);
+    /* RX first, then TX — same as cold boot. */
+    (void)arm_tx_and_wait_frames(c, 1500);
     ESP_LOGI(CAPTURE_LOG_TAG, "CSI recover: cam restarted %ux%u",
              (unsigned)c->hres, (unsigned)c->vres);
     return ESP_OK;
@@ -467,9 +491,6 @@ capture_ctx_t *capture_hw_init_start(void)
     if (!tc_locked(s_cap.tc)) {
         (void)tc358743_hdmi_hotplug_reset(s_cap.tc);
         wait_hdmi_lock(s_cap.tc, 5000);
-    }
-    if (tc_locked(s_cap.tc)) {
-        after_hdmi_lock(s_cap.tc);
     }
 
     resolve_capture_size(s_cap.tc, &s_cap.hres, &s_cap.vres);
@@ -545,12 +566,10 @@ capture_ctx_t *capture_hw_init_start(void)
     ISP.cntl.isp_en = 0;
     capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
 
+    /* 1) P4 CSI RX up  2) arm bridge TX  3) wait for first frame */
     ESP_ERROR_CHECK(esp_cam_ctlr_start(s_cam));
     s_cam_started = true;
-    tc358743_set_csi_uyvy422(s_cap.tc, false);
-    (void)tc358743_reapply_csi_path_after_hdmi(s_cap.tc);
-    (void)tc358743_set_streaming(s_cap.tc, true);
-    capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
+    (void)arm_tx_and_wait_frames(&s_cap, 1500);
 
     ESP_LOGI(CAPTURE_LOG_TAG, "CSI started %ux%u RGB888 frame=%zu lane=%uMbps DT=0x24",
              (unsigned)s_cap.hres, (unsigned)s_cap.vres, s_cap.frame_bytes,
@@ -561,6 +580,5 @@ capture_ctx_t *capture_hw_init_start(void)
 esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
 {
     ESP_RETURN_ON_FALSE(c && c->tc, ESP_ERR_INVALID_ARG, CAPTURE_LOG_TAG, "ctx");
-    /* Always full HPD — soft_kick/CTXRST never restored real pixels in the field. */
     return hard_hpd_recover(c);
 }
