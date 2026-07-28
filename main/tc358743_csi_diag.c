@@ -1,10 +1,13 @@
 /*
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
+ *
+ * One-line pipeline health so a dead stream names the broken stage.
  */
 #include "tc358743.h"
 
 #include <inttypes.h>
+#include <stdio.h>
 
 #include "esp_log.h"
 #include "driver/i2c_master.h"
@@ -27,6 +30,7 @@ static const char *TAG = "tc358743";
 #define CSI_START 0x0518
 #define VI_MUTE 0x857f
 #define VOUT_SET2 0x8573
+#define SYS_STATUS 0x8520
 
 struct tc358743 {
     i2c_master_dev_handle_t i2c;
@@ -106,17 +110,69 @@ void tc358743_debug_bridge(tc358743_t *d)
              "lanes CLW=0x%08" PRIx32 " D0W=0x%08" PRIx32 " D1W=0x%08" PRIx32
              " (bit0=1 means DISABLED)",
              clw, d0w, d1w);
-
-    if (!vbufen) {
-        ESP_LOGE(TAG, "VBUFEN=0 — video FIFO off");
-    }
-    /* TxAct is pulsed during active video only; reading 0 during blanking is normal. */
-    if (!txact && !wsync && vbufen) {
-        ESP_LOGD(TAG, "TxAct=0 sample (blanking window OK if dma_done climbing)");
-    }
 }
 
 void tc358743_debug_stall_extras(tc358743_t *d)
 {
     tc358743_debug_bridge(d);
+}
+
+/**
+ * One-line health for the whole path. Call every few seconds and on stall.
+ *
+ * dma_done / jpeg_seq = current counters
+ * dma_delta / jpeg_delta = increase since last sample (pass 0 if unknown)
+ * clients = active /stream count
+ * stalled = true if CSI wait timed out
+ */
+void tc358743_log_pipeline(tc358743_t *d, uint32_t dma_done, uint32_t dma_delta,
+                           uint32_t jpeg_seq, uint32_t jpeg_delta, int clients, bool stalled)
+{
+    uint8_t st = d ? d8(d, SYS_STATUS) : 0;
+    uint16_t conf = d ? d16(d, CONFCTL) : 0;
+    uint16_t csi = d ? d16(d, CSI_STATUS) : 0;
+    uint32_t txopt = d ? d32(d, TXOPTIONCNTRL) : 0;
+    uint8_t mute = d ? d8(d, VI_MUTE) : 0xff;
+
+    unsigned tmds = (st >> 1) & 1u;
+    unsigned scdt = (st >> 3) & 1u;
+    unsigned hdmi = (st >> 4) & 1u;
+    unsigned sync = (st >> 7) & 1u;
+    unsigned vbufen = conf & 1u;
+    unsigned txact = (csi >> 9) & 1u;
+    unsigned contclk = txopt & 1u;
+
+    const char *hdmi_s = (!tmds || !scdt || !sync) ? "NO_LOCK" : (hdmi ? "HDMI" : "DVI");
+
+    /* Named failure stage — first match wins. */
+    const char *verdict = "OK";
+    if (!d) {
+        verdict = "FAIL:no_bridge";
+    } else if (!tmds || !scdt || !sync) {
+        verdict = "FAIL:HDMI_unlock (no TMDS/SCDT/SYNC — cable/source)";
+    } else if (!vbufen) {
+        verdict = "FAIL:VBUFEN_off (video FIFO disabled)";
+    } else if (mute == 0xc0u) {
+        verdict = "FAIL:AUTO_MUTE (green/blank on DVI — need VI_MUTE=0)";
+    } else if (mute != 0x00u && mute != 0xc0u) {
+        verdict = "FAIL:VI_MUTE_set (video muted)";
+    } else if (stalled && dma_delta == 0) {
+        if (!txact) {
+            verdict = "FAIL:CSI_TX (TxAct=0, DMA stuck — bridge not sending)";
+        } else {
+            verdict = "FAIL:DMA (TxAct=1 but no frames — P4 CSI RX)";
+        }
+    } else if (dma_delta > 0 && jpeg_delta == 0 && clients > 0) {
+        verdict = "FAIL:ENCODE (DMA moves, JPEG seq stuck)";
+    } else if (jpeg_delta > 0 && clients == 0) {
+        verdict = "OK (encoding, no browser yet)";
+    } else if (clients > 0 && jpeg_delta == 0 && dma_delta == 0) {
+        verdict = "FAIL:NO_FRAMES (browser waiting, nothing flowing)";
+    }
+
+    ESP_LOGW("babelbus",
+             "PIPE | %s | TxAct=%u VBUFEN=%u MUTE=0x%02x CONTCLK=%u | "
+             "DMA=%" PRIu32 "(+%" PRIu32 ") JPEG=%" PRIu32 "(+%" PRIu32 ") clients=%d | %s",
+             hdmi_s, txact, vbufen, mute, contclk, dma_done, dma_delta, jpeg_seq, jpeg_delta,
+             clients, verdict);
 }

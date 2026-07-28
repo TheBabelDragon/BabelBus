@@ -1,9 +1,6 @@
 /*
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
- *
- * Toshiba TC358743 HDMI → MIPI CSI-2 bridge
- * Register sequence from drivers/media/i2c/tc358743.c in the Linux kernel.
  */
 #pragma once
 
@@ -55,11 +52,13 @@ esp_err_t tc358743_reapply_csi_path_after_hdmi(tc358743_t *dev);
 esp_err_t tc358743_soft_kick(tc358743_t *dev);
 esp_err_t tc358743_csi_rearm(tc358743_t *dev);
 esp_err_t tc358743_csi_keepalive(tc358743_t *dev);
-/** After P4 CSI RX is started: clock kick + VBUFEN + CSI_START (no HPD/CTXRST). */
 esp_err_t tc358743_arm_csi_tx(tc358743_t *dev);
 void tc358743_debug_bridge(tc358743_t *dev);
 void tc358743_debug_stall_extras(tc358743_t *dev);
 void tc358743_log_link_state(tc358743_t *dev);
+/** One-line pipeline health. */
+void tc358743_log_pipeline(tc358743_t *d, uint32_t dma_done, uint32_t dma_delta,
+                           uint32_t jpeg_seq, uint32_t jpeg_delta, int clients, bool stalled);
 esp_err_t tc358743_set_streaming(tc358743_t *dev, bool on);
 esp_err_t tc358743_read_chip_id(tc358743_t *dev, uint16_t *chip_id);
 esp_err_t tc358743_sys_status(tc358743_t *dev, uint8_t *out_st);
