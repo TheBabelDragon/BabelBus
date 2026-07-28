@@ -17,7 +17,11 @@
 
 #define CAPTURE_LOG_TAG "babelbus"
 
-#define CAPTURE_FB_COUNT 2
+/*
+ * Was 2 — DMA reused a buffer while JPEG still read it → quality collapsed
+ * then solid fill. Four gives ~3 frame periods of headroom at 60 Hz CSI.
+ */
+#define CAPTURE_FB_COUNT 4
 
 /** Max supported capture (buffers allocated once). */
 #define CAPTURE_MAX_H 1920u
@@ -31,6 +35,7 @@ typedef struct {
     size_t fb_alloc_bytes;  /* bytes allocated per FB (≥ frame_bytes) */
     void *fb[CAPTURE_FB_COUNT];
     void *volatile done_fb;
+    volatile int done_fb_idx;
     volatile int ping_fb_idx;
     SemaphoreHandle_t csi_done_sem;
     tc358743_t *tc;

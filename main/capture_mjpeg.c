@@ -2,8 +2,8 @@
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * Match p4kvm: RGB888 CSI → HW JPEG, no pixel_reverse.
- * (pixel_reverse made the stream solid green on this path.)
+ * RGB888 CSI → SPIRAM scratch copy → HW JPEG.
+ * Encoding the live DMA buffer caused progressive corruption (quality blow-up).
  */
 #include "capture_priv.h"
 
@@ -11,9 +11,11 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "esp_cache.h"
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "driver/jpeg_encode.h"
@@ -25,18 +27,38 @@
 #include "tc358743_hdmi_debug.h"
 
 static jpeg_encoder_handle_t s_jpeg_enc;
+static uint8_t *s_encode_scratch;
 
 #ifndef BABELBUS_TARGET_FPS
 #define BABELBUS_TARGET_FPS 25
 #endif
 
+/** Reject mid-grey CSI fill (every sample ~0x80 → sum ≈ 128*256). */
+static bool frame_looks_blank_fill(const uint8_t *p, size_t nbytes)
+{
+    if (!p || nbytes < 256) {
+        return true;
+    }
+    uint32_t sum = 0;
+    size_t mid = nbytes / 2u;
+    for (size_t i = 0; i < 128; i++) {
+        sum += p[i];
+    }
+    for (size_t i = 0; i < 128 && (mid + i) < nbytes; i++) {
+        sum += p[mid + i];
+    }
+    /* 256 * 0x80 = 32768; allow small noise band */
+    return (sum > 32000u && sum < 33536u);
+}
+
 void capture_mjpeg_run(capture_ctx_t *c)
 {
-    jpeg_encode_engine_cfg_t jcfg = {.intr_priority = 0, .timeout_ms = 100};
+    /* 100ms was too short for 1080p → silent failures → frozen then grey. */
+    jpeg_encode_engine_cfg_t jcfg = {.intr_priority = 0, .timeout_ms = 400};
     ESP_ERROR_CHECK(jpeg_new_encoder_engine(&jcfg, &s_jpeg_enc));
 
     if (g_jpeg_frame.jpeg_quality < 1u || g_jpeg_frame.jpeg_quality > 100u) {
-        g_jpeg_frame.jpeg_quality = 50u;
+        g_jpeg_frame.jpeg_quality = (uint8_t)CONFIG_P4KVM_JPEG_QUALITY;
     }
     jpeg_quality_load_from_nvs();
 
@@ -70,8 +92,18 @@ void capture_mjpeg_run(capture_ctx_t *c)
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(CAPTURE_LOG_TAG, "MJPEG ready q=%u fps=%d (p4kvm RGB path)",
-             (unsigned)g_jpeg_frame.jpeg_quality, BABELBUS_TARGET_FPS);
+
+    /* DMA-safe encode source: never JPEG the live CSI buffer in place. */
+    s_encode_scratch = heap_caps_aligned_alloc(64, c->fb_alloc_bytes,
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_encode_scratch) {
+        ESP_LOGE(CAPTURE_LOG_TAG, "encode scratch alloc failed (%zu)", c->fb_alloc_bytes);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(CAPTURE_LOG_TAG, "MJPEG ready q=%u fps=%d scratch=%zu (DMA-safe)",
+             (unsigned)g_jpeg_frame.jpeg_quality, BABELBUS_TARGET_FPS, c->fb_alloc_bytes);
 
     const unsigned bpp = capture_csi_bpp();
     int64_t hdmi_recover_cooldown_until_us = 0;
@@ -98,13 +130,13 @@ void capture_mjpeg_run(capture_ctx_t *c)
         }
 
         void *src = (void *)c->done_fb;
-        if (!src) {
+        size_t nbytes = c->frame_bytes;
+        if (!src || nbytes == 0 || nbytes > c->fb_alloc_bytes) {
             continue;
         }
 
         int64_t now = (int64_t)esp_timer_get_time();
 
-        /* Gentle keepalive — do not CTXRST. */
         if ((now - last_keepalive_us) >= keepalive_interval_us) {
             (void)tc358743_csi_keepalive(c->tc);
             last_keepalive_us = now;
@@ -127,17 +159,27 @@ void capture_mjpeg_run(capture_ctx_t *c)
             continue;
         }
 
-        (void)esp_cache_msync(src, c->frame_bytes, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+        (void)esp_cache_msync(src, nbytes, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+        memcpy(s_encode_scratch, src, nbytes);
+
+        if (frame_looks_blank_fill(s_encode_scratch, nbytes)) {
+            if ((c->csi_dma_done_irqs - last_logged_done) >= 150u) {
+                ESP_LOGW(CAPTURE_LOG_TAG, "skip blank CSI fill done=%lu (not promoting to stream)",
+                         (unsigned long)c->csi_dma_done_irqs);
+                last_logged_done = c->csi_dma_done_irqs;
+            }
+            continue;
+        }
 
         if (c->csi_dma_done_irqs == 1 ||
             (c->csi_dma_done_irqs - last_logged_done) >= 300u) {
-            const uint8_t *p = (const uint8_t *)src;
+            const uint8_t *p = s_encode_scratch;
             uint32_t sum = 0;
-            size_t mid = c->frame_bytes / 2u;
-            for (size_t i = 0; i < 128 && i < c->frame_bytes; i++) {
+            size_t mid = nbytes / 2u;
+            for (size_t i = 0; i < 128 && i < nbytes; i++) {
                 sum += p[i];
             }
-            for (size_t i = 0; i < 128 && (mid + i) < c->frame_bytes; i++) {
+            for (size_t i = 0; i < 128 && (mid + i) < nbytes; i++) {
                 sum += p[mid + i];
             }
             ESP_LOGI(CAPTURE_LOG_TAG, "frame ok done=%lu jpeg_seq=%lu %ux%u pixsum256=%lu",
@@ -162,10 +204,12 @@ void capture_mjpeg_run(capture_ctx_t *c)
             .pixel_reverse = false,
         };
         uint32_t out_sz = 0;
-        esp_err_t er = jpeg_encoder_process(s_jpeg_enc, &enc, src, (uint32_t)c->frame_bytes,
+        esp_err_t er = jpeg_encoder_process(s_jpeg_enc, &enc, s_encode_scratch, (uint32_t)nbytes,
                                             g_jpeg_frame.jpeg_buf[back], (uint32_t)g_jpeg_frame.jpeg_cap,
                                             &out_sz);
         if (er != ESP_OK || out_sz == 0 || out_sz > g_jpeg_frame.jpeg_cap) {
+            ESP_LOGW(CAPTURE_LOG_TAG, "jpeg encode fail %s out=%" PRIu32,
+                     esp_err_to_name(er), out_sz);
             continue;
         }
         if (xSemaphoreTake(g_jpeg_frame.mutex, portMAX_DELAY) == pdTRUE) {
