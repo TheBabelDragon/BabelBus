@@ -1,8 +1,6 @@
 /*
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
- *
- * Always encode. PIPE log every ~5s names the broken stage on failure.
  */
 #include "capture_priv.h"
 
@@ -47,9 +45,6 @@ static void encode_scratch_ensure(size_t need)
     }
     if (s_encode_scratch) {
         s_encode_scratch_bytes = need;
-        ESP_LOGI(CAPTURE_LOG_TAG, "encode scratch %zu bytes", need);
-    } else {
-        ESP_LOGW(CAPTURE_LOG_TAG, "encode scratch failed (%zu) — inplace", need);
     }
 }
 
@@ -92,10 +87,9 @@ void capture_mjpeg_run(capture_ctx_t *c)
     }
 
     encode_scratch_ensure(c->frame_bytes);
-    ESP_LOGI(CAPTURE_LOG_TAG, "MJPEG ready q=%u fps=%d (always encode, PIPE log every 5s)",
+    ESP_LOGI(CAPTURE_LOG_TAG, "MJPEG ready q=%u fps=%d",
              (unsigned)g_jpeg_frame.jpeg_quality, BABELBUS_TARGET_FPS);
 
-    int64_t recover_cooldown_until_us = 0;
     int64_t last_encode_us = 0;
     int64_t last_pipe_us = 0;
     uint32_t last_logged_done = 0;
@@ -105,21 +99,21 @@ void capture_mjpeg_run(capture_ctx_t *c)
     const int64_t pipe_interval_us = (int64_t)5 * 1000000;
 
     while (1) {
-        if (xSemaphoreTake(c->csi_done_sem, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        /* 3s before declare stall — avoid hair-trigger HPD on a live stream. */
+        if (xSemaphoreTake(c->csi_done_sem, pdMS_TO_TICKS(3000)) != pdTRUE) {
             uint32_t dma = c->csi_dma_done_irqs;
             uint32_t jseq = g_jpeg_frame.frame_seq;
-            int clients = jpeg_frame_stream_client_count();
-            tc358743_log_pipeline(c->tc, dma, 0, jseq, 0, clients, true);
+            tc358743_log_pipeline(c->tc, dma, 0, jseq, 0,
+                                  jpeg_frame_stream_client_count(), true);
             capture_debug_csi_timeout(c, 24, c->frame_bytes);
-            int64_t now = (int64_t)esp_timer_get_time();
-            if (now >= recover_cooldown_until_us) {
-                ESP_LOGW(CAPTURE_LOG_TAG, "PIPE action: HPD recover");
-                (void)capture_hw_hdmi_recover(c);
-                recover_cooldown_until_us = now + (int64_t)8 * 1000000;
-                encode_scratch_ensure(c->frame_bytes);
-            }
+            (void)capture_hw_hdmi_recover(c);
+            encode_scratch_ensure(c->frame_bytes);
             continue;
         }
+
+        /* Frames flowing again — clear recover streak. */
+        capture_hw_recover_streak_reset();
+
         while (xSemaphoreTake(c->csi_done_sem, 0) == pdTRUE) {
         }
 
@@ -134,9 +128,8 @@ void capture_mjpeg_run(capture_ctx_t *c)
         if ((now - last_pipe_us) >= pipe_interval_us) {
             uint32_t dma = c->csi_dma_done_irqs;
             uint32_t jseq = g_jpeg_frame.frame_seq;
-            uint32_t ddelta = dma - pipe_dma_mark;
-            uint32_t jdelta = jseq - pipe_jpeg_mark;
-            tc358743_log_pipeline(c->tc, dma, ddelta, jseq, jdelta,
+            tc358743_log_pipeline(c->tc, dma, dma - pipe_dma_mark, jseq,
+                                  jseq - pipe_jpeg_mark,
                                   jpeg_frame_stream_client_count(), false);
             pipe_dma_mark = dma;
             pipe_jpeg_mark = jseq;
@@ -195,8 +188,6 @@ void capture_mjpeg_run(capture_ctx_t *c)
                                             g_jpeg_frame.jpeg_buf[back],
                                             (uint32_t)g_jpeg_frame.jpeg_cap, &out_sz);
         if (er != ESP_OK || out_sz == 0) {
-            ESP_LOGW(CAPTURE_LOG_TAG, "jpeg encode fail %s out=%lu",
-                     esp_err_to_name(er), (unsigned long)out_sz);
             continue;
         }
         if (xSemaphoreTake(g_jpeg_frame.mutex, portMAX_DELAY) == pdTRUE) {

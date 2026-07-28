@@ -17,22 +17,16 @@
 
 #define CAPTURE_LOG_TAG "babelbus"
 
-/*
- * 3 FBs: enough headroom vs JPEG latency without burning 4× max-res SPIRAM.
- * (4 × 1080p RGB888 ≈ 25 MB and left no room for encode scratch.)
- */
 #define CAPTURE_FB_COUNT 3
 
-/** Max supported capture (buffers allocated once). */
 #define CAPTURE_MAX_H 1920u
 #define CAPTURE_MAX_V 1080u
 
-/** Shared CSI / ISP / HDMI state for codec tasks (lives in capture_hw.c). */
 typedef struct {
     uint32_t hres;
     uint32_t vres;
-    size_t frame_bytes;     /* current active frame size */
-    size_t fb_alloc_bytes;  /* bytes allocated per FB (≥ frame_bytes) */
+    size_t frame_bytes;
+    size_t fb_alloc_bytes;
     void *fb[CAPTURE_FB_COUNT];
     void *volatile done_fb;
     volatile int done_fb_idx;
@@ -45,7 +39,10 @@ typedef struct {
 
 capture_ctx_t *capture_hw_init_start(void);
 
+/** Progressive recover: soft TX first, HPD only after repeated stalls. */
 esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c);
+
+void capture_hw_recover_streak_reset(void);
 
 void capture_debug_csi_timeout(capture_ctx_t *c, unsigned bpp, size_t fb_bytes);
 
