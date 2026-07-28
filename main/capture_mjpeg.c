@@ -18,11 +18,11 @@
 #include "freertos/task.h"
 
 #include "jpeg_frame.h"
+#include "tc358743.h"
 #include "tc358743_hdmi_debug.h"
 
 static jpeg_encoder_handle_t s_jpeg_enc;
 
-/* Steady 20 fps beats bursty 30 that stalls the encoder. */
 #ifndef BABELBUS_TARGET_FPS
 #define BABELBUS_TARGET_FPS 20
 #endif
@@ -67,17 +67,19 @@ void capture_mjpeg_run(capture_ctx_t *c)
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(CAPTURE_LOG_TAG, "MJPEG ready q=%u target_fps=%d (copy-free stream)",
+    ESP_LOGI(CAPTURE_LOG_TAG, "MJPEG ready q=%u target_fps=%d + CSI keepalive",
              (unsigned)g_jpeg_frame.jpeg_quality, BABELBUS_TARGET_FPS);
 
     const unsigned bpp = capture_csi_bpp();
     int64_t hdmi_recover_cooldown_until_us = 0;
     uint32_t last_logged_done = 0;
     int64_t last_encode_us = 0;
+    int64_t last_keepalive_us = 0;
     const int64_t min_encode_interval_us = (int64_t)(1000000 / BABELBUS_TARGET_FPS);
+    const int64_t keepalive_interval_us = (int64_t)1500000; /* 1.5 s */
 
     while (1) {
-        if (xSemaphoreTake(c->csi_done_sem, pdMS_TO_TICKS(1500)) != pdTRUE) {
+        if (xSemaphoreTake(c->csi_done_sem, pdMS_TO_TICKS(1200)) != pdTRUE) {
             ESP_LOGW(CAPTURE_LOG_TAG, "csi frame wait timeout (dma_done_irqs=%lu)",
                      (unsigned long)c->csi_dma_done_irqs);
             capture_debug_csi_timeout(c, bpp, c->frame_bytes);
@@ -89,7 +91,6 @@ void capture_mjpeg_run(capture_ctx_t *c)
             continue;
         }
         hdmi_recover_cooldown_until_us = 0;
-        /* Keep only the newest frame — drop backlog for low latency. */
         while (xSemaphoreTake(c->csi_done_sem, 0) == pdTRUE) {
         }
 
@@ -98,11 +99,18 @@ void capture_mjpeg_run(capture_ctx_t *c)
             continue;
         }
 
+        int64_t now = (int64_t)esp_timer_get_time();
+
+        /* Keep CSI TX alive without stopping the cam. */
+        if ((now - last_keepalive_us) >= keepalive_interval_us) {
+            (void)tc358743_csi_keepalive(c->tc);
+            last_keepalive_us = now;
+        }
+
         if (jpeg_frame_stream_client_count() <= 0) {
             continue;
         }
 
-        int64_t now = (int64_t)esp_timer_get_time();
         if ((now - last_encode_us) < min_encode_interval_us) {
             continue;
         }

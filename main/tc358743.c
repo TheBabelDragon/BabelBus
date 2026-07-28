@@ -338,9 +338,7 @@ static void sleep_mode(tc358743_t *d, bool enable)
 
 static void csi_kick_start(tc358743_t *d)
 {
-    /* LP11 → continuous HS: required for P4 continuous-clock RX. */
     wr32(d, TXOPTIONCNTRL, 0);
-    vTaskDelay(pdMS_TO_TICKS(1));
     wr32(d, CSI_START, MASK_STRT);
     wr32(d, TXOPTIONCNTRL, MASK_CONTCLKMODE);
     wr32(d, CSI_START, MASK_STRT);
@@ -577,7 +575,6 @@ static void edid_write_builtin(tc358743_t *d)
     ESP_LOGI(TAG, "EDID loaded (%u bytes)", (unsigned)edid_len);
 }
 
-/** lanes (CTXRST) → color → VBUFEN → continuous clock kick. */
 static void csi_path_arm(tc358743_t *d)
 {
     set_csi_lanes(d, d->cfg.lanes);
@@ -706,6 +703,17 @@ esp_err_t tc358743_csi_rearm(tc358743_t *d)
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
     ESP_LOGI(TAG, "CSI rearm (CTXRST, no HPD)");
     csi_path_arm(d);
+    return ESP_OK;
+}
+
+esp_err_t tc358743_csi_keepalive(tc358743_t *d)
+{
+    ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
+    /* Lightweight: unmute + VBUFEN + continuous-clock pulse. No CTXRST, no HPD. */
+    wr8(d, VI_MUTE, 0);
+    wr16_and_or(d, CONFCTL, (uint16_t) ~(MASK_VBUFEN | MASK_ABUFEN), MASK_VBUFEN | MASK_ABUFEN);
+    wr32(d, TXOPTIONCNTRL, MASK_CONTCLKMODE);
+    wr32(d, CSI_START, MASK_STRT);
     return ESP_OK;
 }
 

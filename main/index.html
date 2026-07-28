@@ -7,73 +7,40 @@
     <title>BabelBus</title>
     <style>
       :root { color-scheme: dark; }
-      body {
-        margin: 0;
-        font-family: system-ui, sans-serif;
-        background: #1a1a1f;
-        color: #e8f0ff;
-      }
+      body { margin: 0; font-family: system-ui, sans-serif; background: #1a1a1f; color: #e8f0ff; }
       header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        gap: 1rem;
-        padding: 0.65rem 1rem;
-        border-bottom: 1px solid #ffffff1f;
+        display: flex; justify-content: space-between; align-items: center; gap: 1rem;
+        padding: 0.65rem 1rem; border-bottom: 1px solid #ffffff1f;
       }
       h1 { margin: 0; font-size: 1.25rem; font-weight: 600; color: #c8d4ee; }
       .right { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
       #st { margin: 0; font-size: 0.9rem; color: #c8d4ee; }
-      #fps { font-variant-numeric: tabular-nums; color: #8bd88b; font-size: 0.9rem; }
-      #fps.hidden { display: none; }
       details { position: relative; }
       summary {
-        list-style: none;
-        cursor: pointer;
-        padding: 0.35rem 0.5rem;
-        border-radius: 6px;
-        color: #c8d4ee;
+        list-style: none; cursor: pointer; padding: 0.35rem 0.5rem;
+        border-radius: 6px; color: #c8d4ee;
       }
       summary::-webkit-details-marker { display: none; }
       summary:hover { background: #ffffff14; }
       .panel {
-        position: absolute;
-        right: 0;
-        top: calc(100% + 0.35rem);
-        z-index: 20;
-        min-width: 16rem;
-        background: #252530;
-        border: 1px solid #ffffff26;
-        border-radius: 8px;
-        padding: 1rem 0.85rem;
-        display: flex;
-        flex-direction: column;
-        gap: 0.75rem;
-        box-shadow: 0 6px 20px #00000073;
+        position: absolute; right: 0; top: calc(100% + 0.35rem); z-index: 20;
+        min-width: 16rem; background: #252530; border: 1px solid #ffffff26;
+        border-radius: 8px; padding: 1rem 0.85rem; display: flex; flex-direction: column;
+        gap: 0.75rem; box-shadow: 0 6px 20px #00000073;
       }
       .panel label { display: flex; flex-direction: column; gap: 0.35rem; font-size: 0.85rem; color: #b8c4dc; }
       .panel .row { display: flex; gap: 0.5rem; align-items: center; }
       input[type="number"] { width: 3.5rem; font: inherit; padding: 0.25rem 0.35rem; }
       input[type="range"] { width: 100%; }
       button {
-        font: inherit;
-        cursor: pointer;
-        color: #e8edf8;
-        background: #353542;
-        border: 1px solid #ffffff24;
-        border-radius: 6px;
-        padding: 0.4rem 0.75rem;
+        font: inherit; cursor: pointer; color: #e8edf8; background: #353542;
+        border: 1px solid #ffffff24; border-radius: 6px; padding: 0.4rem 0.75rem;
       }
       button:hover { background: #3f3f4e; }
-      .wrap { width: 100%; position: relative; }
+      .wrap { width: 100%; background: #000; }
       #view {
-        width: 100%;
-        max-width: 100%;
-        height: auto;
-        aspect-ratio: 16/9;
-        background: #111;
-        display: block;
-        cursor: pointer;
+        width: 100%; max-width: 100%; height: auto; display: block;
+        background: #111; image-rendering: auto;
       }
       .note { color: #888; font-size: 0.85rem; padding: 0.75rem 1rem; }
       #audio-st { color: #8bd88b; font-size: 0.85rem; }
@@ -83,8 +50,7 @@
     <header>
       <h1>BabelBus</h1>
       <div class="right">
-        <p id="st">Connecting…</p>
-        <span id="fps">FPS: --</span>
+        <p id="st">Live</p>
         <span id="audio-st"></span>
         <details>
           <summary title="Settings">⚙</summary>
@@ -92,7 +58,7 @@
             <label>
               Encoding quality (1–100)
               <span class="row">
-                <input type="number" id="jpeg-q" min="1" max="100" step="1" value="50" />
+                <input type="number" id="jpeg-q" min="1" max="100" step="1" value="40" />
                 <button type="button" id="btn-jpeg-q">Apply</button>
               </span>
             </label>
@@ -101,130 +67,47 @@
               <input type="range" id="vol" min="0" max="100" value="80" />
             </label>
             <label class="row">
-              <input type="checkbox" id="show-fps" checked />
-              Show FPS
-            </label>
-            <label class="row">
               <input type="checkbox" id="enable-audio" checked />
               Enable audio
             </label>
             <button type="button" id="btn-audio">Start audio</button>
+            <button type="button" id="btn-reload">Reload stream</button>
           </div>
         </details>
       </div>
     </header>
     <div class="wrap">
-      <canvas id="view" width="720" height="480" title="Click to enable audio"></canvas>
+      <!-- Native MJPEG: browser decodes multipart stream (smoother than JS canvas). -->
+      <img id="view" src="/stream" alt="BabelBus stream" />
     </div>
-    <p class="note">Click the video once to unlock audio (browser policy). Quality/volume in ⚙.</p>
+    <p class="note">Native Motion-JPEG · click video for audio · quality in ⚙</p>
     <script>
       (function () {
-        const canvas = document.getElementById("view");
-        const ctx = canvas.getContext("2d", { alpha: false });
+        const img = document.getElementById("view");
         const st = document.getElementById("st");
-        const fpsEl = document.getElementById("fps");
         const audioSt = document.getElementById("audio-st");
         const jpegQ = document.getElementById("jpeg-q");
         const btnQ = document.getElementById("btn-jpeg-q");
-        const showFps = document.getElementById("show-fps");
         const volEl = document.getElementById("vol");
         const enableAudio = document.getElementById("enable-audio");
         const btnAudio = document.getElementById("btn-audio");
+        const btnReload = document.getElementById("btn-reload");
 
-        let frameCount = 0, lastT = performance.now();
-        let abortCtrl = null;
         let audioCtx = null, gainNode = null, audioAbort = null;
         let nextAudioTime = 0;
         let audioStarted = false;
 
-        function findBytes(hay, needle) {
-          for (let i = 0; i <= hay.length - needle.length; i++) {
-            let j = 0;
-            while (j < needle.length && hay[i + j] === needle[j]) j++;
-            if (j === needle.length) return i;
-          }
-          return -1;
+        function reloadStream() {
+          /* Bust cache + force new /stream connection */
+          img.src = "/stream?t=" + Date.now();
+          st.textContent = "Live";
         }
 
-        const BOUNDARY = new TextEncoder().encode("--frame\r\n");
-        const HEADER_END = new TextEncoder().encode("\r\n\r\n");
-
-        function stopStream() {
-          if (abortCtrl) {
-            try { abortCtrl.abort(); } catch (_) {}
-            abortCtrl = null;
-          }
-        }
-
-        async function stream() {
-          stopStream();
-          abortCtrl = new AbortController();
-          const signal = abortCtrl.signal;
-          for (;;) {
-            if (signal.aborted) return;
-            try {
-              st.textContent = "Streaming";
-              const res = await fetch("/stream", { signal, cache: "no-store" });
-              if (!res.ok || !res.body) throw new Error("stream " + res.status);
-              const reader = res.body.getReader();
-              let buf = new Uint8Array(0);
-              for (;;) {
-                const { done, value } = await reader.read();
-                if (done || signal.aborted) break;
-                if (value && value.length) {
-                  const t = new Uint8Array(buf.length + value.length);
-                  t.set(buf); t.set(value, buf.length); buf = t;
-                }
-                while (buf.length > 0) {
-                  const bIdx = findBytes(buf, BOUNDARY);
-                  if (bIdx < 0) {
-                    if (buf.length > 131072) buf = buf.slice(buf.length - 8192);
-                    break;
-                  }
-                  const after = buf.slice(bIdx + BOUNDARY.length);
-                  const hEnd = findBytes(after, HEADER_END);
-                  if (hEnd < 0) break;
-                  const hText = new TextDecoder().decode(after.slice(0, hEnd));
-                  const m = hText.match(/Content-Length:\s*(\d+)/i);
-                  if (!m) { buf = buf.slice(bIdx + BOUNDARY.length); break; }
-                  const jpegLen = parseInt(m[1], 10);
-                  if (jpegLen <= 0 || jpegLen > 4 * 1024 * 1024) {
-                    buf = buf.slice(bIdx + BOUNDARY.length);
-                    break;
-                  }
-                  const start = bIdx + BOUNDARY.length + hEnd + HEADER_END.length;
-                  const end = start + jpegLen + 2;
-                  if (buf.length < end) break;
-                  const jpeg = buf.slice(start, start + jpegLen);
-                  try {
-                    const bmp = await createImageBitmap(new Blob([jpeg], { type: "image/jpeg" }));
-                    if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
-                      canvas.width = bmp.width;
-                      canvas.height = bmp.height;
-                    }
-                    ctx.drawImage(bmp, 0, 0);
-                    bmp.close();
-                    frameCount++;
-                    if (performance.now() - lastT >= 1000) {
-                      if (showFps.checked) {
-                        fpsEl.textContent = "FPS: " + frameCount;
-                        fpsEl.classList.remove("hidden");
-                      }
-                      frameCount = 0;
-                      lastT = performance.now();
-                    }
-                  } catch (_) {}
-                  buf = buf.slice(end);
-                }
-              }
-              if (!signal.aborted) st.textContent = "Reconnecting…";
-            } catch (e) {
-              if (signal.aborted) return;
-              st.textContent = "Reconnecting…";
-            }
-            await new Promise((r) => setTimeout(r, 250));
-          }
-        }
+        img.addEventListener("error", () => {
+          st.textContent = "Reconnecting…";
+          setTimeout(reloadStream, 400);
+        });
+        img.addEventListener("load", () => { st.textContent = "Live"; });
 
         async function syncQ() {
           try {
@@ -250,15 +133,8 @@
         }
 
         function stopAudio() {
-          if (audioAbort) {
-            try { audioAbort.abort(); } catch (_) {}
-            audioAbort = null;
-          }
-          if (audioCtx) {
-            try { audioCtx.close(); } catch (_) {}
-            audioCtx = null;
-            gainNode = null;
-          }
+          if (audioAbort) { try { audioAbort.abort(); } catch (_) {} audioAbort = null; }
+          if (audioCtx) { try { audioCtx.close(); } catch (_) {} audioCtx = null; gainNode = null; }
           nextAudioTime = 0;
           audioStarted = false;
           audioSt.textContent = "";
@@ -275,7 +151,6 @@
             gainNode.gain.value = (parseInt(volEl.value, 10) || 80) / 100;
             gainNode.connect(audioCtx.destination);
             nextAudioTime = audioCtx.currentTime + 0.05;
-
             const res = await fetch("/audio", { signal: audioAbort.signal, cache: "no-store" });
             if (!res.ok || !res.body) {
               audioSt.textContent = "Audio N/A";
@@ -295,7 +170,6 @@
               const frames = Math.floor(t.length / 4);
               leftover = t.slice(frames * 4);
               if (frames < 64) continue;
-
               const buf = audioCtx.createBuffer(2, frames, 48000);
               const L = buf.getChannelData(0), R = buf.getChannelData(1);
               const dv = new DataView(t.buffer, t.byteOffset, frames * 4);
@@ -309,18 +183,10 @@
               const startAt = Math.max(nextAudioTime, audioCtx.currentTime + 0.02);
               src.start(startAt);
               nextAudioTime = startAt + frames / 48000;
-              /* drop backlog if we fell behind */
-              if (nextAudioTime < audioCtx.currentTime - 0.2) {
-                nextAudioTime = audioCtx.currentTime + 0.05;
-              }
+              if (nextAudioTime < audioCtx.currentTime - 0.2) nextAudioTime = audioCtx.currentTime + 0.05;
             }
-          } catch (e) {
-            if (audioAbort && !audioAbort.signal.aborted) {
-              audioSt.textContent = "Audio err";
-            }
-          }
-          if (audioStarted && enableAudio.checked && !audioAbort.signal.aborted) {
-            /* auto-retry after drop */
+          } catch (_) {}
+          if (audioStarted && enableAudio.checked && audioAbort && !audioAbort.signal.aborted) {
             setTimeout(() => { if (enableAudio.checked) startAudio(); }, 500);
           }
         }
@@ -333,25 +199,19 @@
 
         btnQ.addEventListener("click", applyQ);
         jpegQ.addEventListener("keydown", (e) => { if (e.key === "Enter") applyQ(); });
-        showFps.addEventListener("change", () => {
-          fpsEl.classList.toggle("hidden", !showFps.checked);
-        });
         volEl.addEventListener("input", () => {
           if (gainNode) gainNode.gain.value = (parseInt(volEl.value, 10) || 0) / 100;
         });
         enableAudio.addEventListener("change", () => {
-          if (enableAudio.checked) unlockAudio();
-          else stopAudio();
+          if (enableAudio.checked) unlockAudio(); else stopAudio();
         });
         btnAudio.addEventListener("click", unlockAudio);
-        canvas.addEventListener("click", unlockAudio);
+        btnReload.addEventListener("click", reloadStream);
+        img.addEventListener("click", unlockAudio);
         document.body.addEventListener("pointerdown", unlockAudio, { once: true });
-
-        window.addEventListener("pagehide", () => { stopStream(); stopAudio(); });
-        window.addEventListener("beforeunload", () => { stopStream(); stopAudio(); });
+        window.addEventListener("pagehide", stopAudio);
 
         syncQ();
-        stream();
       })();
     </script>
   </body>
