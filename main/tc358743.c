@@ -2,9 +2,10 @@
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * Waveshare ESP32-P4 path that produced real frames:
- *  continuous MIPI clock + VI_MUTE=0 (full unmute) + VBUFEN.
- * AUTO_MUTE (0xc0) left DVI/DVD sources with blank/green fill or TxAct=0.
+ * Matched to jrowny/p4kvm + Linux tc358743:
+ *   TXOPTIONCNTRL = 0 (non-continuous)
+ *   VI_MUTE = AUTO_MUTE (0xc0) when streaming
+ *   enable_hdmi_output: stream on → HPD high → CSI_START
  */
 #include "tc358743.h"
 
@@ -337,15 +338,6 @@ static void sleep_mode(tc358743_t *d, bool enable)
     wr16_and_or(d, SYSCTL, (uint16_t)~MASK_SLEEP, enable ? MASK_SLEEP : 0);
 }
 
-static void csi_clock_kick(tc358743_t *d)
-{
-    wr32(d, TXOPTIONCNTRL, 0);
-    wr32(d, CSI_START, MASK_STRT);
-    vTaskDelay(pdMS_TO_TICKS(1));
-    wr32(d, TXOPTIONCNTRL, MASK_CONTCLKMODE);
-    wr32(d, CSI_START, MASK_STRT);
-}
-
 static void apply_hdmi_or_dvi(tc358743_t *d)
 {
     uint8_t st = rd8(d, SYS_STATUS);
@@ -357,14 +349,12 @@ static void apply_hdmi_or_dvi(tc358743_t *d)
     }
 }
 
+/** p4kvm: AUTO_MUTE on, no continuous-clock kick. */
 static void enable_stream(tc358743_t *d, bool enable)
 {
     if (enable) {
-        csi_clock_kick(d);
-        wr8(d, VI_MUTE, 0x00);
+        wr8(d, VI_MUTE, MASK_AUTO_MUTE);
         wr16_and_or(d, CONFCTL, (uint16_t) ~(MASK_VBUFEN | MASK_ABUFEN), MASK_VBUFEN | MASK_ABUFEN);
-        /* Extra CSI_START after VBUFEN — TxAct stays 0 without this on some boots. */
-        wr32(d, CSI_START, MASK_STRT);
     } else {
         wr8(d, VI_MUTE, MASK_AUTO_MUTE | MASK_VI_MUTE);
         wr16_and_or(d, CONFCTL, (uint16_t) ~(MASK_VBUFEN | MASK_ABUFEN), 0);
@@ -530,6 +520,7 @@ void tc358743_set_csi_uyvy422(tc358743_t *d, bool uyvy422)
     apply_csi_color_space(d);
 }
 
+/** p4kvm: TXOPTIONCNTRL=0 always (non-continuous). */
 static void set_csi_lanes(tc358743_t *d, unsigned lanes)
 {
     tc358743_cfg_t *pdata = &d->cfg;
@@ -561,8 +552,6 @@ static void set_csi_lanes(tc358743_t *d, unsigned lanes)
     wr32(d, CSI_CONFW, MASK_MODE_SET | MASK_ADDRESS_CSI_ERR_INTENA | MASK_TXBRK | MASK_QUNK | MASK_WCER | MASK_INER);
     wr32(d, CSI_CONFW, MASK_MODE_CLEAR | MASK_ADDRESS_CSI_ERR_HALT | MASK_TXBRK | MASK_QUNK);
     wr32(d, CSI_CONFW, MASK_MODE_SET | MASK_ADDRESS_CSI_INT_ENA | MASK_INTER);
-    wr32(d, TXOPTIONCNTRL, MASK_CONTCLKMODE);
-    wr32(d, CSI_START, MASK_STRT);
 }
 
 static void hpd_set(tc358743_t *d, bool on)
@@ -600,7 +589,6 @@ esp_err_t tc358743_probe(i2c_master_bus_handle_t bus, const tc358743_cfg_t *cfg,
     esp_err_t err = i2c_master_bus_add_device(bus, &dev_cfg, &d->i2c);
     if (err != ESP_OK) {
         free(d);
-        ESP_LOGE(TAG, "i2c add device fail %s", esp_err_to_name(err));
         return err;
     }
     *out_dev = d;
@@ -647,7 +635,6 @@ esp_err_t tc358743_init_streaming(tc358743_t *d)
     apply_csi_color_space(d);
     wr16(d, INTSTATUS, 0xffff);
     wr16(d, INTMASK, (uint16_t)(~(MASK_HDMI_MSK | MASK_CSI_MSK) & 0xffff));
-    tc358743_debug_status(d);
     return ESP_OK;
 }
 
@@ -655,11 +642,11 @@ esp_err_t tc358743_enable_hdmi_output(tc358743_t *d)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
     enable_stream(d, true);
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(150));
     hpd_set(d, true);
     vTaskDelay(pdMS_TO_TICKS(50));
-    enable_stream(d, true);
-    ESP_LOGI(TAG, "HPD armed VI_MUTE=0 CONTCLK=1");
+    wr32(d, CSI_START, MASK_STRT);
+    ESP_LOGI(TAG, "HPD armed VI_MUTE=AUTO_MUTE TXOPT=0 (p4kvm)");
     tc358743_debug_status(d);
     return ESP_OK;
 }
@@ -667,7 +654,6 @@ esp_err_t tc358743_enable_hdmi_output(tc358743_t *d)
 esp_err_t tc358743_hdmi_hotplug_reset(tc358743_t *d)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
-    ESP_LOGI(TAG, "HDMI hotplug reset");
     enable_stream(d, false);
     hpd_set(d, false);
     vTaskDelay(pdMS_TO_TICKS(250));
@@ -681,41 +667,34 @@ esp_err_t tc358743_reapply_csi_path_after_hdmi(tc358743_t *d)
     apply_csi_color_space(d);
     set_csi_lanes(d, d->cfg.lanes);
     enable_stream(d, true);
+    wr32(d, CSI_START, MASK_STRT);
     return ESP_OK;
 }
 
 esp_err_t tc358743_soft_kick(tc358743_t *d)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
-    wr16_and_or(d, CONFCTL, (uint16_t) ~(MASK_VBUFEN | MASK_ABUFEN), 0);
-    wr8(d, VI_MUTE, MASK_VI_MUTE);
-    vTaskDelay(pdMS_TO_TICKS(5));
     enable_stream(d, true);
+    wr32(d, CSI_START, MASK_STRT);
     return ESP_OK;
 }
 
 esp_err_t tc358743_csi_rearm(tc358743_t *d)
 {
-    ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
-    ESP_LOGI(TAG, "CSI rearm CTXRST (no HPD)");
     return tc358743_reapply_csi_path_after_hdmi(d);
 }
 
 esp_err_t tc358743_csi_keepalive(tc358743_t *d)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
-    enable_stream(d, true);
+    wr32(d, CSI_START, MASK_STRT);
     return ESP_OK;
 }
 
 esp_err_t tc358743_arm_csi_tx(tc358743_t *d)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
-    /* Call after P4 CSI RX is started. No HPD, no CTXRST — just force TX. */
-    apply_hdmi_or_dvi(d);
     enable_stream(d, true);
-    wr32(d, CSI_START, MASK_STRT);
-    vTaskDelay(pdMS_TO_TICKS(5));
     wr32(d, CSI_START, MASK_STRT);
     return ESP_OK;
 }
@@ -727,11 +706,10 @@ esp_err_t tc358743_get_avi_color_format(tc358743_t *d, uint8_t *out_y)
     }
     uint8_t avi[32];
     memset(avi, 0, sizeof(avi));
-    esp_err_t er = i2c_read_reg(d, PK_AVI_0HEAD, avi, PK_AVI_LEN);
-    if (er != ESP_OK) {
-        return er;
+    if (i2c_read_reg(d, PK_AVI_0HEAD, avi, PK_AVI_LEN) != ESP_OK) {
+        return ESP_FAIL;
     }
-    if (avi[0] != 0x82u || avi[2] < 2u || PK_AVI_LEN < 6u) {
+    if (avi[0] != 0x82u || avi[2] < 2u) {
         return ESP_ERR_NOT_FOUND;
     }
     *out_y = (uint8_t)((avi[5] >> 5) & 7u);
@@ -742,5 +720,8 @@ esp_err_t tc358743_set_streaming(tc358743_t *d, bool on)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
     enable_stream(d, on);
+    if (on) {
+        wr32(d, CSI_START, MASK_STRT);
+    }
     return ESP_OK;
 }
