@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * MJPEG for <img src="/stream">.
- * Grey = worker died or multipart stalled with no JPEG.
- * Keepalive only when encode stalls — never flood the browser.
+ * On connect: push whatever JPEG is already encoded — do not wait for the
+ * next CSI frame or the browser sits grey.
  */
 #include "http_server.h"
 
@@ -33,8 +33,7 @@ static const char *TAG = "babelbus";
 #define AUDIO_CHUNK 2048
 #define STREAM_COPY_CAP (768 * 1024)
 #define STREAM_SEND_RETRIES 4
-/* Only re-send last JPEG when encode has been quiet this long (not a flood). */
-#define STREAM_KEEPALIVE_MS 500
+#define STREAM_KEEPALIVE_MS 1000
 
 extern const char index_html_start[] asm("_binary_index_html_start");
 extern const char index_html_end[] asm("_binary_index_html_end");
@@ -115,6 +114,26 @@ static esp_err_t stream_send_parts(httpd_req_t *req, const char *hdr, int hl, co
     return ESP_FAIL;
 }
 
+static bool copy_front_jpeg(uint8_t *dst, size_t cap, size_t *out_len, uint32_t *out_seq)
+{
+    bool ok = false;
+    if (xSemaphoreTake(g_jpeg_frame.mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return false;
+    }
+    int f = g_jpeg_frame.front_idx;
+    if (f >= 0 && f < JPEG_SLOT_COUNT && g_jpeg_frame.jpeg_buf[f]) {
+        size_t n = g_jpeg_frame.jpeg_len[f];
+        if (n > 0 && n <= g_jpeg_frame.jpeg_cap && n <= cap) {
+            memcpy(dst, g_jpeg_frame.jpeg_buf[f], n);
+            *out_len = n;
+            *out_seq = g_jpeg_frame.frame_seq;
+            ok = true;
+        }
+    }
+    xSemaphoreGive(g_jpeg_frame.mutex);
+    return ok;
+}
+
 static void stream_worker_task(void *arg)
 {
     httpd_req_t *req = (httpd_req_t *)arg;
@@ -142,6 +161,30 @@ static void stream_worker_task(void *arg)
     uint32_t last_seq = 0;
     size_t last_good_len = 0;
     TickType_t last_send_tick = xTaskGetTickCount();
+
+    /* Push the already-encoded frame immediately so the browser is not grey. */
+    {
+        size_t n = 0;
+        uint32_t seq = 0;
+        if (copy_front_jpeg(copy, STREAM_COPY_CAP, &n, &seq) && n > 0) {
+            int hl = snprintf(hdr, sizeof(hdr),
+                              "--frame\r\n"
+                              "Content-Type: image/jpeg\r\n"
+                              "Content-Length: %zu\r\n"
+                              "\r\n",
+                              n);
+            if (hl > 0 && hl < (int)sizeof(hdr) &&
+                stream_send_parts(req, hdr, hl, copy, n) == ESP_OK) {
+                last_seq = seq;
+                if (last_good) {
+                    memcpy(last_good, copy, n);
+                    last_good_len = n;
+                }
+                last_send_tick = xTaskGetTickCount();
+                ESP_LOGI(TAG, "/stream: first JPEG seq=%lu %zu bytes", (unsigned long)seq, n);
+            }
+        }
+    }
 
     while (1) {
         if (stream_peer_disconnected(req)) {
@@ -181,35 +224,19 @@ static void stream_worker_task(void *arg)
         uint32_t seq_snap = last_seq;
 
         if (!want_keepalive && g_jpeg_frame.frame_seq != last_seq) {
-            if (xSemaphoreTake(g_jpeg_frame.mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                int f = g_jpeg_frame.front_idx;
-                seq_snap = g_jpeg_frame.frame_seq;
-                if (f >= 0 && f < JPEG_SLOT_COUNT && g_jpeg_frame.jpeg_buf[f]) {
-                    size_t n = g_jpeg_frame.jpeg_len[f];
-                    if (n > 0 && n <= g_jpeg_frame.jpeg_cap && n <= STREAM_COPY_CAP) {
-                        memcpy(copy, g_jpeg_frame.jpeg_buf[f], n);
-                        send_ptr = copy;
-                        send_len = n;
-                        if (last_good) {
-                            memcpy(last_good, copy, n);
-                            last_good_len = n;
-                        } else {
-                            last_good_len = n;
-                        }
-                    } else if (n > STREAM_COPY_CAP) {
-                        ESP_LOGW(TAG, "JPEG %zu > %u — lower quality in ⚙",
-                                 n, (unsigned)STREAM_COPY_CAP);
-                    }
+            size_t n = 0;
+            if (copy_front_jpeg(copy, STREAM_COPY_CAP, &n, &seq_snap) && n > 0) {
+                send_ptr = copy;
+                send_len = n;
+                if (last_good) {
+                    memcpy(last_good, copy, n);
+                    last_good_len = n;
                 }
-                xSemaphoreGive(g_jpeg_frame.mutex);
             }
         }
 
         if (send_len == 0 && last_good_len > 0 && last_good) {
             send_ptr = last_good;
-            send_len = last_good_len;
-        } else if (send_len == 0 && last_good_len > 0) {
-            send_ptr = copy;
             send_len = last_good_len;
         }
 

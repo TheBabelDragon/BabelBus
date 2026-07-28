@@ -2,8 +2,8 @@
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * Simple encode path: no blank-streak HPD, no bridge keepalive.
- * Recover only when DMA truly stops (p4kvm-style).
+ * Always encode while CSI delivers frames so /stream has a JPEG ready
+ * the moment the browser connects (no "Connecting…" grey wait).
  */
 #include "capture_priv.h"
 
@@ -29,7 +29,7 @@ static uint8_t *s_encode_scratch;
 static size_t s_encode_scratch_bytes;
 
 #ifndef BABELBUS_TARGET_FPS
-#define BABELBUS_TARGET_FPS 20
+#define BABELBUS_TARGET_FPS 15
 #endif
 
 static void encode_scratch_ensure(size_t need)
@@ -48,6 +48,9 @@ static void encode_scratch_ensure(size_t need)
     }
     if (s_encode_scratch) {
         s_encode_scratch_bytes = need;
+        ESP_LOGI(CAPTURE_LOG_TAG, "encode scratch %zu bytes", need);
+    } else {
+        ESP_LOGW(CAPTURE_LOG_TAG, "encode scratch failed (%zu) — inplace", need);
     }
 }
 
@@ -90,7 +93,7 @@ void capture_mjpeg_run(capture_ctx_t *c)
     }
 
     encode_scratch_ensure(c->frame_bytes);
-    ESP_LOGI(CAPTURE_LOG_TAG, "MJPEG ready q=%u fps=%d",
+    ESP_LOGI(CAPTURE_LOG_TAG, "MJPEG ready q=%u fps=%d (always encode)",
              (unsigned)g_jpeg_frame.jpeg_quality, BABELBUS_TARGET_FPS);
 
     int64_t recover_cooldown_until_us = 0;
@@ -100,7 +103,8 @@ void capture_mjpeg_run(capture_ctx_t *c)
 
     while (1) {
         if (xSemaphoreTake(c->csi_done_sem, pdMS_TO_TICKS(2000)) != pdTRUE) {
-            ESP_LOGW(CAPTURE_LOG_TAG, "csi timeout done=%lu", (unsigned long)c->csi_dma_done_irqs);
+            ESP_LOGW(CAPTURE_LOG_TAG, "csi timeout done=%lu",
+                     (unsigned long)c->csi_dma_done_irqs);
             capture_debug_csi_timeout(c, 24, c->frame_bytes);
             int64_t now = (int64_t)esp_timer_get_time();
             if (now >= recover_cooldown_until_us) {
@@ -119,9 +123,7 @@ void capture_mjpeg_run(capture_ctx_t *c)
             continue;
         }
 
-        if (jpeg_frame_stream_client_count() <= 0) {
-            continue;
-        }
+        /* Always encode — browser may open /stream any time. */
 
         int64_t now = (int64_t)esp_timer_get_time();
         if ((now - last_encode_us) < min_encode_interval_us) {
@@ -138,16 +140,21 @@ void capture_mjpeg_run(capture_ctx_t *c)
         }
 
         (void)esp_cache_msync(src, nbytes, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
-        const uint8_t *enc_src = (const uint8_t *)src;
+
+        const uint8_t *enc_src;
         if (s_encode_scratch && s_encode_scratch_bytes >= nbytes) {
             memcpy(s_encode_scratch, src, nbytes);
             enc_src = s_encode_scratch;
+        } else {
+            enc_src = (const uint8_t *)src;
         }
 
-        if (c->csi_dma_done_irqs == 1 || (c->csi_dma_done_irqs - last_logged_done) >= 300u) {
+        if (c->csi_dma_done_irqs == 1 ||
+            (c->csi_dma_done_irqs - last_logged_done) >= 300u) {
             ESP_LOGI(CAPTURE_LOG_TAG, "frame ok done=%lu jpeg_seq=%lu %ux%u",
-                     (unsigned long)c->csi_dma_done_irqs, (unsigned long)g_jpeg_frame.frame_seq,
-                     (unsigned)c->hres, (unsigned)c->vres);
+                     (unsigned long)c->csi_dma_done_irqs,
+                     (unsigned long)g_jpeg_frame.frame_seq, (unsigned)c->hres,
+                     (unsigned)c->vres);
             last_logged_done = c->csi_dma_done_irqs;
         }
 
@@ -168,8 +175,8 @@ void capture_mjpeg_run(capture_ctx_t *c)
         };
         uint32_t out_sz = 0;
         esp_err_t er = jpeg_encoder_process(s_jpeg_enc, &enc, (uint8_t *)enc_src, (uint32_t)nbytes,
-                                            g_jpeg_frame.jpeg_buf[back], (uint32_t)g_jpeg_frame.jpeg_cap,
-                                            &out_sz);
+                                            g_jpeg_frame.jpeg_buf[back],
+                                            (uint32_t)g_jpeg_frame.jpeg_cap, &out_sz);
         if (er != ESP_OK || out_sz == 0) {
             continue;
         }
