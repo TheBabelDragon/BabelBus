@@ -17,6 +17,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_private/esp_cache_private.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -114,7 +115,6 @@ static bool tc_locked(tc358743_t *tc)
     if (st == 0xffu || st == 0xdfu || st == 0x7fu || st == 0x9fu || st == 0xf7u || st == 0xfdu) {
         return false;
     }
-    /* TMDS + SCDT + SYNC (bits 1, 3, 7). */
     return ((st & 0x02) != 0) && ((st & 0x08) != 0) && ((st & 0x80) != 0);
 }
 
@@ -348,7 +348,6 @@ static esp_err_t recreate_csi_at_size(capture_ctx_t *c, uint32_t hres, uint32_t 
     return ESP_OK;
 }
 
-/** Cam stop → CTXRST rearm bridge → cam start. No HPD. */
 static esp_err_t rearm_stream(capture_ctx_t *c)
 {
     uint32_t done_before = c->csi_dma_done_irqs;
@@ -376,7 +375,6 @@ static esp_err_t rearm_stream(capture_ctx_t *c)
     s_cam_started = true;
     (void)tc358743_set_streaming(c->tc, true);
 
-    /* Wait for real frames. */
     for (int i = 0; i < 15; i++) {
         vTaskDelay(pdMS_TO_TICKS(40));
         if (c->csi_dma_done_irqs > done_before) {
@@ -536,19 +534,16 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
 {
     ESP_RETURN_ON_FALSE(c && c->tc, ESP_ERR_INVALID_ARG, CAPTURE_LOG_TAG, "ctx");
 
-    /* While HDMI still locked: full CSI TX rearm (CTXRST) — never HPD. */
     if (tc_locked(c->tc)) {
         ESP_LOGW(CAPTURE_LOG_TAG, "CSI rearm (locked, no HPD) streak=%d", s_rearm_fail_streak);
         if (rearm_stream(c) == ESP_OK) {
             return ESP_OK;
         }
-        /* Stay locked but TX dead — try rearm again later; HPD only if unlocked. */
         if (s_rearm_fail_streak < 6) {
             return ESP_ERR_TIMEOUT;
         }
     }
 
-    /* Rate-limit HPD: at most once per 8s. */
     int64_t now = (int64_t)esp_timer_get_time();
     if ((now - s_last_hpd_us) < (int64_t)8 * 1000000) {
         ESP_LOGW(CAPTURE_LOG_TAG, "HPD rate-limited — retry rearm only");
