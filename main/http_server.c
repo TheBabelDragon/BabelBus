@@ -4,6 +4,11 @@
  *
  * On browser refresh the old /stream socket dies with errno 104/128.
  * That is normal. We reclaim the stream lock so the new tab is not 503.
+ *
+ * Buffering policy (anti-grey):
+ *  - Large SPIRAM copy buffer so high-q 1080p JPEG is never truncated.
+ *  - Soft retry on transient send errors (TCP back-pressure).
+ *  - Re-send last good frame when encode lags so the <img> never goes blank.
  */
 #include "http_server.h"
 
@@ -30,7 +35,10 @@ static const char *TAG = "babelbus";
 #define STREAM_WORKER_PRIO (tskIDLE_PRIORITY + 7)
 #define AUDIO_WORKER_STACK (8 * 1024)
 #define AUDIO_CHUNK 2048
-#define STREAM_COPY_CAP (512 * 1024)
+/* High-quality 1080p JPEG can exceed 512 KB; previously that caused silent skips → grey. */
+#define STREAM_COPY_CAP (1536 * 1024)
+#define STREAM_SEND_RETRIES 4
+#define STREAM_KEEPALIVE_MS 400
 
 extern const char index_html_start[] asm("_binary_index_html_start");
 extern const char index_html_end[] asm("_binary_index_html_end");
@@ -89,6 +97,29 @@ static bool stream_peer_disconnected(httpd_req_t *req)
     return false;
 }
 
+static esp_err_t stream_send_parts(httpd_req_t *req, const char *hdr, int hl, const uint8_t *body,
+                                   size_t body_len)
+{
+    for (int attempt = 0; attempt < STREAM_SEND_RETRIES; attempt++) {
+        if (stream_peer_disconnected(req)) {
+            return ESP_FAIL;
+        }
+        esp_err_t se = httpd_resp_send_chunk(req, hdr, hl);
+        if (se == ESP_OK) {
+            se = httpd_resp_send_chunk(req, (const char *)body, body_len);
+        }
+        if (se == ESP_OK) {
+            se = httpd_resp_send_chunk(req, "\r\n", 2);
+        }
+        if (se == ESP_OK) {
+            return ESP_OK;
+        }
+        /* Transient back-pressure / short timeout — brief yield then retry. */
+        vTaskDelay(pdMS_TO_TICKS(15 + attempt * 10));
+    }
+    return ESP_FAIL;
+}
+
 static void stream_worker_task(void *arg)
 {
     httpd_req_t *req = (httpd_req_t *)arg;
@@ -107,6 +138,9 @@ static void stream_worker_task(void *arg)
 
     jpeg_frame_stream_enter();
     uint32_t last_seq = g_jpeg_frame.frame_seq;
+    size_t last_good_len = 0;
+    uint32_t last_good_seq = 0;
+    TickType_t last_send_tick = xTaskGetTickCount();
 
     while (1) {
         if (stream_peer_disconnected(req)) {
@@ -114,11 +148,17 @@ static void stream_worker_task(void *arg)
         }
 
         bool stop = false;
+        bool got_new = false;
         while (g_jpeg_frame.frame_seq == last_seq) {
             if (!g_jpeg_frame.frame_ready_sem) {
                 vTaskDelay(pdMS_TO_TICKS(5));
                 if (stream_peer_disconnected(req)) {
                     stop = true;
+                    break;
+                }
+                /* Keepalive: re-send last good frame so browser does not grey out. */
+                if (last_good_len > 0 &&
+                    (xTaskGetTickCount() - last_send_tick) >= pdMS_TO_TICKS(STREAM_KEEPALIVE_MS)) {
                     break;
                 }
                 continue;
@@ -128,10 +168,15 @@ static void stream_worker_task(void *arg)
                     stop = true;
                     break;
                 }
+                if (last_good_len > 0 &&
+                    (xTaskGetTickCount() - last_send_tick) >= pdMS_TO_TICKS(STREAM_KEEPALIVE_MS)) {
+                    break;
+                }
                 continue;
             }
             while (xSemaphoreTake(g_jpeg_frame.frame_ready_sem, 0) == pdTRUE) {
             }
+            got_new = true;
         }
         if (stop) {
             break;
@@ -139,19 +184,34 @@ static void stream_worker_task(void *arg)
 
         size_t copy_len = 0;
         uint32_t seq_snap = last_seq;
-        if (xSemaphoreTake(g_jpeg_frame.mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
-            continue;
-        }
-        int f = g_jpeg_frame.front_idx;
-        seq_snap = g_jpeg_frame.frame_seq;
-        if (f >= 0 && f < JPEG_SLOT_COUNT && g_jpeg_frame.jpeg_buf[f]) {
-            size_t n = g_jpeg_frame.jpeg_len[f];
-            if (n > 0 && n <= g_jpeg_frame.jpeg_cap && n <= STREAM_COPY_CAP) {
-                memcpy(copy, g_jpeg_frame.jpeg_buf[f], n);
-                copy_len = n;
+
+        if (got_new || g_jpeg_frame.frame_seq != last_seq) {
+            if (xSemaphoreTake(g_jpeg_frame.mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+                continue;
             }
+            int f = g_jpeg_frame.front_idx;
+            seq_snap = g_jpeg_frame.frame_seq;
+            if (f >= 0 && f < JPEG_SLOT_COUNT && g_jpeg_frame.jpeg_buf[f]) {
+                size_t n = g_jpeg_frame.jpeg_len[f];
+                if (n > 0 && n <= g_jpeg_frame.jpeg_cap && n <= STREAM_COPY_CAP) {
+                    memcpy(copy, g_jpeg_frame.jpeg_buf[f], n);
+                    copy_len = n;
+                } else if (n > STREAM_COPY_CAP) {
+                    ESP_LOGW(TAG, "JPEG %zu > STREAM_COPY_CAP %u — raise quality limit or buffer",
+                             n, (unsigned)STREAM_COPY_CAP);
+                }
+            }
+            xSemaphoreGive(g_jpeg_frame.mutex);
+
+            if (copy_len > 0) {
+                last_good_len = copy_len;
+                last_good_seq = seq_snap;
+            }
+        } else if (last_good_len > 0) {
+            /* No new frame; re-use previous good JPEG for keepalive. */
+            copy_len = last_good_len;
+            seq_snap = last_good_seq;
         }
-        xSemaphoreGive(g_jpeg_frame.mutex);
 
         if (copy_len == 0) {
             last_seq = seq_snap;
@@ -169,22 +229,12 @@ static void stream_worker_task(void *arg)
             continue;
         }
 
-        if (stream_peer_disconnected(req)) {
-            break;
-        }
-
-        esp_err_t se = httpd_resp_send_chunk(req, hdr, hl);
-        if (se == ESP_OK) {
-            se = httpd_resp_send_chunk(req, (const char *)copy, copy_len);
-        }
-        if (se == ESP_OK) {
-            se = httpd_resp_send_chunk(req, "\r\n", 2);
-        }
-        if (se != ESP_OK) {
+        if (stream_send_parts(req, hdr, hl, copy, copy_len) != ESP_OK) {
             /* errno 104/128 on refresh — expected, not a bug */
             break;
         }
         last_seq = seq_snap;
+        last_send_tick = xTaskGetTickCount();
     }
 
     jpeg_frame_stream_leave();
@@ -287,8 +337,9 @@ httpd_handle_t http_server_start(void)
     cfg.server_port = 80;
     cfg.stack_size = 16 * 1024;
     cfg.task_priority = tskIDLE_PRIORITY + 6;
-    cfg.send_wait_timeout = 3;
-    cfg.recv_wait_timeout = 3;
+    /* Longer timeout for large JPEG chunks over Ethernet/Wi-Fi; was 3s → premature disconnect. */
+    cfg.send_wait_timeout = 8;
+    cfg.recv_wait_timeout = 5;
     cfg.keep_alive_enable = false;
     cfg.uri_match_fn = httpd_uri_match_wildcard;
     cfg.lru_purge_enable = true;

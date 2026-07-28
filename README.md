@@ -40,10 +40,18 @@ Internal I2C pull-ups are enabled in firmware (required for many FPC / adapter c
 | Adapter pad | Wire (yours) | Signal        | Default P4 GPIO |
 |-------------|--------------|---------------|-----------------|
 | GND         | **Black**    | Ground        | GND             |
-| OSCK        | *(empty)*    | Optional MCLK | leave open      |
+| OSCK        | *(empty)*    | Optional MCLK | **leave open**  |
 | **WFS**     | **Yellow**   | I2S WS/LRCK   | **GPIO 21**     |
 | **SD**      | **Blue**     | I2S DIN       | **GPIO 22**     |
 | **SCK**     | **White**    | I2S BCLK      | **GPIO 20**     |
+
+**OSCK, IR, and INT do not need to be wired for the audio pipeline.**
+
+- **OSCK** (A_OSCK) is the optional oversampling / MCLK clock. The TC358743 is I2S master; the P4 runs as I2S slave with `mclk = unused`. Leave OSCK open.
+- **INT** is the chip interrupt output (HDMI / status events). BabelBus polls `SYS_STATUS` over I2C, so INT is unused.
+- **IR** is the infrared remote input on the TC358743. Completely unrelated to HDMI audio/video capture.
+
+Only **SCK + WFS + SD + GND** are required for `GET /audio`.
 
 Change GPIOs under **menuconfig → BabelBus → I2S audio** if those pins conflict on your header.
 
@@ -105,6 +113,14 @@ that means the **TC358743 is not on the I2C bus**.
 4. Rebuild with the current main (internal I2C pull-ups are enabled).
 
 When it is healthy the scan should show **both** `0x0F` and usually `0x18`, and CHIPID will not be a repeated byte.
+
+## Stream buffering / grey screen
+
+If the picture goes grey and the browser keeps reconnecting:
+
+1. Prefer **Ethernet** over Wi‑Fi for 1080p.
+2. Lower JPEG quality (⚙ → 30–50) if the link is constrained.
+3. Current firmware keeps a 1.5 MB SPIRAM copy buffer, retries TCP sends, and re-sends the last good frame during brief stalls so the `<img>` does not go blank.
 
 ## Security
 

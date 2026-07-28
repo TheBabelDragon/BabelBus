@@ -96,18 +96,33 @@
         let audioCtx = null, gainNode = null, audioAbort = null;
         let nextAudioTime = 0;
         let audioStarted = false;
+        let reconnectDelay = 400;
+        let reconnectTimer = null;
 
         function reloadStream() {
+          if (reconnectTimer) {
+            clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+          }
           /* Bust cache + force new /stream connection */
           img.src = "/stream?t=" + Date.now();
           st.textContent = "Live";
+          reconnectDelay = 400;
         }
 
         img.addEventListener("error", () => {
           st.textContent = "Reconnecting…";
-          setTimeout(reloadStream, 400);
+          /* Keep previous pixels visible; do not clear src (avoids grey flash). */
+          if (reconnectTimer) clearTimeout(reconnectTimer);
+          reconnectTimer = setTimeout(() => {
+            reloadStream();
+            reconnectDelay = Math.min(reconnectDelay * 1.5, 3000);
+          }, reconnectDelay);
         });
-        img.addEventListener("load", () => { st.textContent = "Live"; });
+        img.addEventListener("load", () => {
+          st.textContent = "Live";
+          reconnectDelay = 400;
+        });
 
         async function syncQ() {
           try {
