@@ -73,8 +73,10 @@
         aspect-ratio: 16/9;
         background: #111;
         display: block;
+        cursor: pointer;
       }
       .note { color: #888; font-size: 0.85rem; padding: 0.75rem 1rem; }
+      #audio-st { color: #8bd88b; font-size: 0.85rem; }
     </style>
   </head>
   <body>
@@ -82,14 +84,15 @@
       <h1>BabelBus</h1>
       <div class="right">
         <p id="st">Connecting…</p>
-        <span id="fps" class="hidden">FPS: --</span>
+        <span id="fps">FPS: --</span>
+        <span id="audio-st"></span>
         <details>
           <summary title="Settings">⚙</summary>
           <div class="panel">
             <label>
               Encoding quality (1–100)
               <span class="row">
-                <input type="number" id="jpeg-q" min="1" max="100" step="1" value="55" />
+                <input type="number" id="jpeg-q" min="1" max="100" step="1" value="50" />
                 <button type="button" id="btn-jpeg-q">Apply</button>
               </span>
             </label>
@@ -102,32 +105,37 @@
               Show FPS
             </label>
             <label class="row">
-              <input type="checkbox" id="enable-audio" />
+              <input type="checkbox" id="enable-audio" checked />
               Enable audio
             </label>
+            <button type="button" id="btn-audio">Start audio</button>
           </div>
         </details>
       </div>
     </header>
     <div class="wrap">
-      <canvas id="view" width="720" height="480"></canvas>
+      <canvas id="view" width="720" height="480" title="Click to enable audio"></canvas>
     </div>
-    <p class="note">MJPEG stream · refresh is safe · quality/volume in ⚙</p>
+    <p class="note">Click the video once to unlock audio (browser policy). Quality/volume in ⚙.</p>
     <script>
       (function () {
         const canvas = document.getElementById("view");
         const ctx = canvas.getContext("2d", { alpha: false });
         const st = document.getElementById("st");
         const fpsEl = document.getElementById("fps");
+        const audioSt = document.getElementById("audio-st");
         const jpegQ = document.getElementById("jpeg-q");
         const btnQ = document.getElementById("btn-jpeg-q");
         const showFps = document.getElementById("show-fps");
         const volEl = document.getElementById("vol");
         const enableAudio = document.getElementById("enable-audio");
+        const btnAudio = document.getElementById("btn-audio");
 
         let frameCount = 0, lastT = performance.now();
         let abortCtrl = null;
         let audioCtx = null, gainNode = null, audioAbort = null;
+        let nextAudioTime = 0;
+        let audioStarted = false;
 
         function findBytes(hay, needle) {
           for (let i = 0; i <= hay.length - needle.length; i++) {
@@ -170,7 +178,7 @@
                 while (buf.length > 0) {
                   const bIdx = findBytes(buf, BOUNDARY);
                   if (bIdx < 0) {
-                    if (buf.length > 65536) buf = buf.slice(buf.length - 4096);
+                    if (buf.length > 131072) buf = buf.slice(buf.length - 8192);
                     break;
                   }
                   const after = buf.slice(bIdx + BOUNDARY.length);
@@ -180,6 +188,10 @@
                   const m = hText.match(/Content-Length:\s*(\d+)/i);
                   if (!m) { buf = buf.slice(bIdx + BOUNDARY.length); break; }
                   const jpegLen = parseInt(m[1], 10);
+                  if (jpegLen <= 0 || jpegLen > 4 * 1024 * 1024) {
+                    buf = buf.slice(bIdx + BOUNDARY.length);
+                    break;
+                  }
                   const start = bIdx + BOUNDARY.length + hEnd + HEADER_END.length;
                   const end = start + jpegLen + 2;
                   if (buf.length < end) break;
@@ -205,11 +217,12 @@
                   buf = buf.slice(end);
                 }
               }
+              if (!signal.aborted) st.textContent = "Reconnecting…";
             } catch (e) {
               if (signal.aborted) return;
               st.textContent = "Reconnecting…";
             }
-            await new Promise((r) => setTimeout(r, 400));
+            await new Promise((r) => setTimeout(r, 250));
           }
         }
 
@@ -246,22 +259,31 @@
             audioCtx = null;
             gainNode = null;
           }
+          nextAudioTime = 0;
+          audioStarted = false;
+          audioSt.textContent = "";
         }
 
         async function startAudio() {
+          if (!enableAudio.checked) return;
           stopAudio();
           audioAbort = new AbortController();
           try {
             audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+            if (audioCtx.state === "suspended") await audioCtx.resume();
             gainNode = audioCtx.createGain();
             gainNode.gain.value = (parseInt(volEl.value, 10) || 80) / 100;
             gainNode.connect(audioCtx.destination);
+            nextAudioTime = audioCtx.currentTime + 0.05;
+
             const res = await fetch("/audio", { signal: audioAbort.signal, cache: "no-store" });
             if (!res.ok || !res.body) {
-              st.textContent = "Audio unavailable";
+              audioSt.textContent = "Audio N/A";
               stopAudio();
               return;
             }
+            audioStarted = true;
+            audioSt.textContent = "🔊";
             const reader = res.body.getReader();
             let leftover = new Uint8Array(0);
             for (;;) {
@@ -272,29 +294,41 @@
               t.set(leftover); t.set(value, leftover.length);
               const frames = Math.floor(t.length / 4);
               leftover = t.slice(frames * 4);
-              if (frames === 0) continue;
-              const f32 = new Float32Array(frames * 2);
-              const dv = new DataView(t.buffer, t.byteOffset, frames * 4);
-              for (let i = 0; i < frames; i++) {
-                f32[i * 2] = dv.getInt16(i * 4, true) / 32768;
-                f32[i * 2 + 1] = dv.getInt16(i * 4 + 2, true) / 32768;
-              }
+              if (frames < 64) continue;
+
               const buf = audioCtx.createBuffer(2, frames, 48000);
               const L = buf.getChannelData(0), R = buf.getChannelData(1);
+              const dv = new DataView(t.buffer, t.byteOffset, frames * 4);
               for (let i = 0; i < frames; i++) {
-                L[i] = f32[i * 2];
-                R[i] = f32[i * 2 + 1];
+                L[i] = dv.getInt16(i * 4, true) / 32768;
+                R[i] = dv.getInt16(i * 4 + 2, true) / 32768;
               }
               const src = audioCtx.createBufferSource();
               src.buffer = buf;
               src.connect(gainNode);
-              src.start();
+              const startAt = Math.max(nextAudioTime, audioCtx.currentTime + 0.02);
+              src.start(startAt);
+              nextAudioTime = startAt + frames / 48000;
+              /* drop backlog if we fell behind */
+              if (nextAudioTime < audioCtx.currentTime - 0.2) {
+                nextAudioTime = audioCtx.currentTime + 0.05;
+              }
             }
           } catch (e) {
-            if (!audioAbort || !audioAbort.signal.aborted) {
-              /* ignore */
+            if (audioAbort && !audioAbort.signal.aborted) {
+              audioSt.textContent = "Audio err";
             }
           }
+          if (audioStarted && enableAudio.checked && !audioAbort.signal.aborted) {
+            /* auto-retry after drop */
+            setTimeout(() => { if (enableAudio.checked) startAudio(); }, 500);
+          }
+        }
+
+        function unlockAudio() {
+          if (!enableAudio.checked) return;
+          if (audioStarted && audioCtx && audioCtx.state === "running") return;
+          startAudio();
         }
 
         btnQ.addEventListener("click", applyQ);
@@ -306,14 +340,16 @@
           if (gainNode) gainNode.gain.value = (parseInt(volEl.value, 10) || 0) / 100;
         });
         enableAudio.addEventListener("change", () => {
-          if (enableAudio.checked) startAudio();
+          if (enableAudio.checked) unlockAudio();
           else stopAudio();
         });
+        btnAudio.addEventListener("click", unlockAudio);
+        canvas.addEventListener("click", unlockAudio);
+        document.body.addEventListener("pointerdown", unlockAudio, { once: true });
 
         window.addEventListener("pagehide", () => { stopStream(); stopAudio(); });
         window.addEventListener("beforeunload", () => { stopStream(); stopAudio(); });
 
-        fpsEl.classList.remove("hidden");
         syncQ();
         stream();
       })();
