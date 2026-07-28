@@ -50,7 +50,7 @@
     <header>
       <h1>BabelBus</h1>
       <div class="right">
-        <p id="st">Live</p>
+        <p id="st">Connecting…</p>
         <span id="audio-st"></span>
         <details>
           <summary title="Settings">⚙</summary>
@@ -77,8 +77,7 @@
       </div>
     </header>
     <div class="wrap">
-      <!-- Native MJPEG: browser decodes multipart stream (smoother than JS canvas). -->
-      <img id="view" src="/stream" alt="BabelBus stream" />
+      <img id="view" alt="BabelBus stream" />
     </div>
     <p class="note">Native Motion-JPEG · click video for audio · quality in ⚙</p>
     <script>
@@ -96,32 +95,41 @@
         let audioCtx = null, gainNode = null, audioAbort = null;
         let nextAudioTime = 0;
         let audioStarted = false;
-        let reconnectDelay = 400;
         let reconnectTimer = null;
+        let backoffMs = 500;
+        let connecting = false;
 
         function reloadStream() {
+          if (connecting) return;
+          connecting = true;
+          st.textContent = "Connecting…";
+          /* Bust cache; force new /stream socket */
+          img.src = "/stream?t=" + Date.now();
+          /* Clear connecting flag after browser has had time to attach */
+          setTimeout(function () { connecting = false; }, 300);
+        }
+
+        function scheduleReconnect() {
+          if (reconnectTimer) return;
+          st.textContent = "Reconnecting…";
+          const wait = backoffMs;
+          backoffMs = Math.min(backoffMs * 1.5, 4000);
+          reconnectTimer = setTimeout(function () {
+            reconnectTimer = null;
+            reloadStream();
+          }, wait);
+        }
+
+        img.addEventListener("error", function () {
+          scheduleReconnect();
+        });
+        img.addEventListener("load", function () {
+          st.textContent = "Live";
+          backoffMs = 500;
           if (reconnectTimer) {
             clearTimeout(reconnectTimer);
             reconnectTimer = null;
           }
-          /* Bust cache + force new /stream connection */
-          img.src = "/stream?t=" + Date.now();
-          st.textContent = "Live";
-          reconnectDelay = 400;
-        }
-
-        img.addEventListener("error", () => {
-          st.textContent = "Reconnecting…";
-          /* Keep previous pixels visible; do not clear src (avoids grey flash). */
-          if (reconnectTimer) clearTimeout(reconnectTimer);
-          reconnectTimer = setTimeout(() => {
-            reloadStream();
-            reconnectDelay = Math.min(reconnectDelay * 1.5, 3000);
-          }, reconnectDelay);
-        });
-        img.addEventListener("load", () => {
-          st.textContent = "Live";
-          reconnectDelay = 400;
         });
 
         async function syncQ() {
@@ -202,7 +210,7 @@
             }
           } catch (_) {}
           if (audioStarted && enableAudio.checked && audioAbort && !audioAbort.signal.aborted) {
-            setTimeout(() => { if (enableAudio.checked) startAudio(); }, 500);
+            setTimeout(function () { if (enableAudio.checked) startAudio(); }, 500);
           }
         }
 
@@ -213,20 +221,26 @@
         }
 
         btnQ.addEventListener("click", applyQ);
-        jpegQ.addEventListener("keydown", (e) => { if (e.key === "Enter") applyQ(); });
-        volEl.addEventListener("input", () => {
+        jpegQ.addEventListener("keydown", function (e) { if (e.key === "Enter") applyQ(); });
+        volEl.addEventListener("input", function () {
           if (gainNode) gainNode.gain.value = (parseInt(volEl.value, 10) || 0) / 100;
         });
-        enableAudio.addEventListener("change", () => {
+        enableAudio.addEventListener("change", function () {
           if (enableAudio.checked) unlockAudio(); else stopAudio();
         });
         btnAudio.addEventListener("click", unlockAudio);
-        btnReload.addEventListener("click", reloadStream);
+        btnReload.addEventListener("click", function () {
+          backoffMs = 500;
+          if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+          reloadStream();
+        });
         img.addEventListener("click", unlockAudio);
         document.body.addEventListener("pointerdown", unlockAudio, { once: true });
         window.addEventListener("pagehide", stopAudio);
 
         syncQ();
+        /* Start stream after layout — avoids racing DOM with /stream. */
+        setTimeout(reloadStream, 50);
       })();
     </script>
   </body>
