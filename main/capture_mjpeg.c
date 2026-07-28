@@ -208,8 +208,8 @@ void capture_mjpeg_run(capture_ctx_t *c)
                                             g_jpeg_frame.jpeg_buf[back], (uint32_t)g_jpeg_frame.jpeg_cap,
                                             &out_sz);
         if (er != ESP_OK || out_sz == 0 || out_sz > g_jpeg_frame.jpeg_cap) {
-            ESP_LOGW(CAPTURE_LOG_TAG, "jpeg encode fail %s out=%" PRIu32,
-                     esp_err_to_name(er), out_sz);
+            ESP_LOGW(CAPTURE_LOG_TAG, "jpeg encode fail %s out=%lu",
+                     esp_err_to_name(er), (unsigned long)out_sz);
             continue;
         }
         if (xSemaphoreTake(g_jpeg_frame.mutex, portMAX_DELAY) == pdTRUE) {
