@@ -2,12 +2,9 @@
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * CSI enable path matches jrowny/p4kvm + Linux drivers/media/i2c/tc358743.c:
- *   TXOPTIONCNTRL = 0 (non-continuous)
- *   VI_MUTE = AUTO_MUTE (0xc0) on stream-on
- *   CSI_START rewritten after VBUFEN / HPD
- *
- * Previous BabelBus CONTCLKMODE=1 + VI_MUTE=0 left TxAct=0 on DVI/DVD sources.
+ * Waveshare ESP32-P4 path that produced real frames:
+ *  continuous MIPI clock + VI_MUTE=0 (full unmute) + VBUFEN.
+ * AUTO_MUTE (0xc0) left DVI/DVD sources with blank/green fill or TxAct=0.
  */
 #include "tc358743.h"
 
@@ -340,21 +337,14 @@ static void sleep_mode(tc358743_t *d, bool enable)
     wr16_and_or(d, SYSCTL, (uint16_t)~MASK_SLEEP, enable ? MASK_SLEEP : 0);
 }
 
-/**
- * Linux / p4kvm enable_stream:
- *   on:  VI_MUTE = AUTO_MUTE (0xc0), VBUFEN|ABUFEN
- *   off: VI_MUTE = AUTO_MUTE|VI_MUTE, clear VBUFEN
- * Non-continuous clock is set in set_csi_lanes (TXOPTIONCNTRL=0).
- */
-static void enable_stream(tc358743_t *d, bool enable)
+/** LP11 → continuous HS clock. Required on Waveshare P4 RX. */
+static void csi_clock_kick(tc358743_t *d)
 {
-    if (enable) {
-        wr8(d, VI_MUTE, MASK_AUTO_MUTE);
-        wr16_and_or(d, CONFCTL, (uint16_t) ~(MASK_VBUFEN | MASK_ABUFEN), MASK_VBUFEN | MASK_ABUFEN);
-    } else {
-        wr8(d, VI_MUTE, MASK_AUTO_MUTE | MASK_VI_MUTE);
-        wr16_and_or(d, CONFCTL, (uint16_t) ~(MASK_VBUFEN | MASK_ABUFEN), 0);
-    }
+    wr32(d, TXOPTIONCNTRL, 0);
+    wr32(d, CSI_START, MASK_STRT);
+    vTaskDelay(pdMS_TO_TICKS(1));
+    wr32(d, TXOPTIONCNTRL, MASK_CONTCLKMODE);
+    wr32(d, CSI_START, MASK_STRT);
 }
 
 static void apply_hdmi_or_dvi(tc358743_t *d)
@@ -364,8 +354,20 @@ static void apply_hdmi_or_dvi(tc358743_t *d)
     if (hdmi) {
         wr8_and_or(d, VI_MODE, (uint8_t)~MASK_RGB_DVI, 0);
     } else {
-        /* DVI source (DVD players etc.): force RGB_DVI path */
         wr8_and_or(d, VI_MODE, (uint8_t)~MASK_RGB_DVI, MASK_RGB_DVI);
+    }
+}
+
+/** Stream on: VI_MUTE=0 (full unmute). AUTO_MUTE caused green/blank on this board. */
+static void enable_stream(tc358743_t *d, bool enable)
+{
+    if (enable) {
+        csi_clock_kick(d);
+        wr8(d, VI_MUTE, 0x00);
+        wr16_and_or(d, CONFCTL, (uint16_t) ~(MASK_VBUFEN | MASK_ABUFEN), MASK_VBUFEN | MASK_ABUFEN);
+    } else {
+        wr8(d, VI_MUTE, MASK_AUTO_MUTE | MASK_VI_MUTE);
+        wr16_and_or(d, CONFCTL, (uint16_t) ~(MASK_VBUFEN | MASK_ABUFEN), 0);
     }
 }
 
@@ -528,10 +530,6 @@ void tc358743_set_csi_uyvy422(tc358743_t *d, bool uyvy422)
     apply_csi_color_space(d);
 }
 
-/**
- * p4kvm / Linux set_csi(): TXOPTIONCNTRL = 0 (non-continuous MIPI clock).
- * Permanent CONTCLKMODE left CSI TxAct=0 on several DVI sources on P4.
- */
 static void set_csi_lanes(tc358743_t *d, unsigned lanes)
 {
     tc358743_cfg_t *pdata = &d->cfg;
@@ -555,7 +553,6 @@ static void set_csi_lanes(tc358743_t *d, unsigned lanes)
          ((lanes > 0) ? MASK_CLM_HSTXVREGEN : 0) | ((lanes > 0) ? MASK_D0M_HSTXVREGEN : 0) |
              ((lanes > 1) ? MASK_D1M_HSTXVREGEN : 0) | ((lanes > 2) ? MASK_D2M_HSTXVREGEN : 0) |
              ((lanes > 3) ? MASK_D3M_HSTXVREGEN : 0));
-    /* Non-continuous clock — required for reliable TxAct on ESP32-P4 + this adapter. */
     wr32(d, TXOPTIONCNTRL, 0);
     wr32(d, STARTCNTRL, MASK_START);
     wr32(d, CSI_START, MASK_STRT);
@@ -564,6 +561,8 @@ static void set_csi_lanes(tc358743_t *d, unsigned lanes)
     wr32(d, CSI_CONFW, MASK_MODE_SET | MASK_ADDRESS_CSI_ERR_INTENA | MASK_TXBRK | MASK_QUNK | MASK_WCER | MASK_INER);
     wr32(d, CSI_CONFW, MASK_MODE_CLEAR | MASK_ADDRESS_CSI_ERR_HALT | MASK_TXBRK | MASK_QUNK);
     wr32(d, CSI_CONFW, MASK_MODE_SET | MASK_ADDRESS_CSI_INT_ENA | MASK_INTER);
+    wr32(d, TXOPTIONCNTRL, MASK_CONTCLKMODE);
+    wr32(d, CSI_START, MASK_STRT);
 }
 
 static void hpd_set(tc358743_t *d, bool on)
@@ -655,13 +654,12 @@ esp_err_t tc358743_init_streaming(tc358743_t *d)
 esp_err_t tc358743_enable_hdmi_output(tc358743_t *d)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
-    /* p4kvm tail: stream on → delay → HPD high → CSI_START pulse */
     enable_stream(d, true);
-    vTaskDelay(pdMS_TO_TICKS(150));
+    vTaskDelay(pdMS_TO_TICKS(100));
     hpd_set(d, true);
     vTaskDelay(pdMS_TO_TICKS(50));
-    wr32(d, CSI_START, MASK_STRT);
-    ESP_LOGI(TAG, "HPD armed VI_MUTE=AUTO_MUTE TXOPT=0 (non-cont)");
+    enable_stream(d, true);
+    ESP_LOGI(TAG, "HPD armed VI_MUTE=0 CONTCLK=1");
     tc358743_debug_status(d);
     return ESP_OK;
 }
@@ -683,19 +681,16 @@ esp_err_t tc358743_reapply_csi_path_after_hdmi(tc358743_t *d)
     apply_csi_color_space(d);
     set_csi_lanes(d, d->cfg.lanes);
     enable_stream(d, true);
-    wr32(d, CSI_START, MASK_STRT);
     return ESP_OK;
 }
 
 esp_err_t tc358743_soft_kick(tc358743_t *d)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
-    /* Pulse VBUFEN then full stream-on (AUTO_MUTE path). No CTXRST, no HPD. */
     wr16_and_or(d, CONFCTL, (uint16_t) ~(MASK_VBUFEN | MASK_ABUFEN), 0);
-    wr8(d, VI_MUTE, MASK_AUTO_MUTE | MASK_VI_MUTE);
+    wr8(d, VI_MUTE, MASK_VI_MUTE);
     vTaskDelay(pdMS_TO_TICKS(5));
     enable_stream(d, true);
-    wr32(d, CSI_START, MASK_STRT);
     return ESP_OK;
 }
 
@@ -710,7 +705,6 @@ esp_err_t tc358743_csi_keepalive(tc358743_t *d)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
     enable_stream(d, true);
-    wr32(d, CSI_START, MASK_STRT);
     return ESP_OK;
 }
 
@@ -736,8 +730,5 @@ esp_err_t tc358743_set_streaming(tc358743_t *d, bool on)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
     enable_stream(d, on);
-    if (on) {
-        wr32(d, CSI_START, MASK_STRT);
-    }
     return ESP_OK;
 }
