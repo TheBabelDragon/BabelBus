@@ -22,18 +22,18 @@
 
 static jpeg_encoder_handle_t s_jpeg_enc;
 
-/* Soft cap — only drop when encode cannot keep up (no free slot). */
+/* Steady 20 fps beats bursty 30 that stalls the encoder. */
 #ifndef BABELBUS_TARGET_FPS
-#define BABELBUS_TARGET_FPS 30
+#define BABELBUS_TARGET_FPS 20
 #endif
 
 void capture_mjpeg_run(capture_ctx_t *c)
 {
-    jpeg_encode_engine_cfg_t jcfg = {.intr_priority = 0, .timeout_ms = 200};
+    jpeg_encode_engine_cfg_t jcfg = {.intr_priority = 0, .timeout_ms = 150};
     ESP_ERROR_CHECK(jpeg_new_encoder_engine(&jcfg, &s_jpeg_enc));
 
     if (g_jpeg_frame.jpeg_quality < 1u || g_jpeg_frame.jpeg_quality > 100u) {
-        g_jpeg_frame.jpeg_quality = 50u;
+        g_jpeg_frame.jpeg_quality = 40u;
     }
     jpeg_quality_load_from_nvs();
 
@@ -67,7 +67,7 @@ void capture_mjpeg_run(capture_ctx_t *c)
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(CAPTURE_LOG_TAG, "JPEG path ready q=%u target_fps=%d",
+    ESP_LOGI(CAPTURE_LOG_TAG, "MJPEG ready q=%u target_fps=%d (copy-free stream)",
              (unsigned)g_jpeg_frame.jpeg_quality, BABELBUS_TARGET_FPS);
 
     const unsigned bpp = capture_csi_bpp();
@@ -89,6 +89,7 @@ void capture_mjpeg_run(capture_ctx_t *c)
             continue;
         }
         hdmi_recover_cooldown_until_us = 0;
+        /* Keep only the newest frame — drop backlog for low latency. */
         while (xSemaphoreTake(c->csi_done_sem, 0) == pdTRUE) {
         }
 
@@ -106,9 +107,8 @@ void capture_mjpeg_run(capture_ctx_t *c)
             continue;
         }
 
-        /* Pick slot first — if busy, drop without cache sync cost. */
         int back = -1;
-        if (xSemaphoreTake(g_jpeg_frame.mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        if (xSemaphoreTake(g_jpeg_frame.mutex, pdMS_TO_TICKS(2)) == pdTRUE) {
             back = jpeg_frame_pick_encode_slot();
             xSemaphoreGive(g_jpeg_frame.mutex);
         }
@@ -151,9 +151,6 @@ void capture_mjpeg_run(capture_ctx_t *c)
                                             g_jpeg_frame.jpeg_buf[back], (uint32_t)g_jpeg_frame.jpeg_cap,
                                             &out_sz);
         if (er != ESP_OK || out_sz == 0 || out_sz > g_jpeg_frame.jpeg_cap) {
-            if (er != ESP_OK) {
-                ESP_LOGW(CAPTURE_LOG_TAG, "jpeg_encoder_process %s", esp_err_to_name(er));
-            }
             continue;
         }
         if (xSemaphoreTake(g_jpeg_frame.mutex, portMAX_DELAY) == pdTRUE) {
@@ -163,6 +160,6 @@ void capture_mjpeg_run(capture_ctx_t *c)
             xSemaphoreGive(g_jpeg_frame.mutex);
         }
         jpeg_frame_notify_new_frame();
-        last_encode_us = now;
+        last_encode_us = (int64_t)esp_timer_get_time();
     }
 }
