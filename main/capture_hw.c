@@ -2,8 +2,8 @@
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * Order that works on Waveshare P4: start CSI RX, then arm bridge TX.
- * TxAct=0 with HDMI locked = RX up before TX was forced.
+ * Boot order matched to jrowny/p4kvm:
+ *   init_streaming → create/enable cam → enable_hdmi_output → wait lock → cam start
  */
 #include "capture_priv.h"
 
@@ -66,51 +66,22 @@ static void tc358743_resetn_pulse(void)
     gpio_set_level(rst, 0);
     vTaskDelay(pdMS_TO_TICKS(100));
     gpio_set_level(rst, 1);
-    vTaskDelay(pdMS_TO_TICKS(400));
+    vTaskDelay(pdMS_TO_TICKS(200));
     ESP_LOGI(CAPTURE_LOG_TAG, "TC358743 RESETN released on GPIO %d", rst);
 #else
-    ESP_LOGW(CAPTURE_LOG_TAG, "No RESET GPIO configured — waiting 500 ms for POR");
     vTaskDelay(pdMS_TO_TICKS(500));
 #endif
 }
 
 static bool tc358743_present(i2c_master_bus_handle_t bus)
 {
-    esp_err_t er = i2c_master_probe(bus, TC358743_I2C_ADDR, 200);
-    if (er == ESP_OK) {
-        ESP_LOGI(CAPTURE_LOG_TAG, "TC358743 ACK at 0x%02x", (unsigned)TC358743_I2C_ADDR);
-        return true;
-    }
-    ESP_LOGE(CAPTURE_LOG_TAG, "TC358743 probe 0x%02x failed: %s", (unsigned)TC358743_I2C_ADDR,
-             esp_err_to_name(er));
-    return false;
-}
-
-static void i2c_bus_scan(i2c_master_bus_handle_t bus)
-{
-    ESP_LOGI(CAPTURE_LOG_TAG, "I2C scan...");
-    int found = 0;
-    for (uint16_t addr = 1; addr < 0x7f; addr++) {
-        if (i2c_master_probe(bus, addr, 50) == ESP_OK) {
-            ESP_LOGI(CAPTURE_LOG_TAG, "  ACK at 0x%02x", (unsigned)addr);
-            found++;
-        }
-    }
-    ESP_LOGI(CAPTURE_LOG_TAG, "I2C scan: %d device(s)", found);
+    return i2c_master_probe(bus, TC358743_I2C_ADDR, 200) == ESP_OK;
 }
 
 static bool tc_locked(tc358743_t *tc)
 {
     uint8_t st = 0;
-    uint16_t id = 0;
     if (tc358743_sys_status(tc, &st) != ESP_OK) {
-        return false;
-    }
-    (void)tc358743_read_chip_id(tc, &id);
-    if ((id & 0xffu) == ((id >> 8) & 0xffu) && (id & 0xffu) != 0) {
-        return false;
-    }
-    if (st == 0xffu || st == 0xdfu || st == 0x7fu || st == 0x9fu || st == 0xf7u || st == 0xfdu) {
         return false;
     }
     return ((st & 0x02) != 0) && ((st & 0x08) != 0) && ((st & 0x80) != 0);
@@ -119,7 +90,6 @@ static bool tc_locked(tc358743_t *tc)
 static void wait_hdmi_lock(tc358743_t *tc, uint32_t timeout_ms)
 {
     uint32_t waited = 0;
-    ESP_LOGI(CAPTURE_LOG_TAG, "wait HDMI TMDS+SCDT+SYNC up to %" PRIu32 " ms", timeout_ms);
     while (waited < timeout_ms) {
         if (tc_locked(tc)) {
             uint8_t st = 0;
@@ -129,13 +99,9 @@ static void wait_hdmi_lock(tc358743_t *tc, uint32_t timeout_ms)
         }
         vTaskDelay(pdMS_TO_TICKS(100));
         waited += 100;
-        if ((waited % 2000) == 0) {
-            tc358743_debug_status(tc);
-        }
     }
     ESP_LOGW(CAPTURE_LOG_TAG, "HDMI lock timeout");
     tc358743_debug_status(tc);
-    tc358743_log_link_state(tc);
 }
 
 static bool read_hdmi_timing(tc358743_t *tc, uint32_t *hres, uint32_t *vres)
@@ -155,28 +121,6 @@ static bool read_hdmi_timing(tc358743_t *tc, uint32_t *hres, uint32_t *vres)
     return true;
 }
 
-static void resolve_capture_size(tc358743_t *tc, uint32_t *hres, uint32_t *vres)
-{
-    if (read_hdmi_timing(tc, hres, vres)) {
-        ESP_LOGI(CAPTURE_LOG_TAG, "CSI sized to HDMI source %ux%u", (unsigned)*hres, (unsigned)*vres);
-    } else {
-        *hres = 720u;
-        *vres = 480u;
-        ESP_LOGW(CAPTURE_LOG_TAG, "CSI fallback %ux%u", (unsigned)*hres, (unsigned)*vres);
-    }
-}
-
-static void after_hdmi_lock(tc358743_t *tc)
-{
-    uint32_t h = 0, v = 0;
-    if (read_hdmi_timing(tc, &h, &v)) {
-        ESP_LOGI(CAPTURE_LOG_TAG, "HDMI timing HAct=%u VAct=%u", (unsigned)h, (unsigned)v);
-    }
-    tc358743_set_csi_uyvy422(tc, false);
-    (void)tc358743_reapply_csi_path_after_hdmi(tc);
-    ESP_LOGI(CAPTURE_LOG_TAG, "CSI path reapplied after HDMI lock");
-}
-
 static void drain_done_sem(capture_ctx_t *c)
 {
     while (c->csi_done_sem && xSemaphoreTake(c->csi_done_sem, 0) == pdTRUE) {
@@ -194,54 +138,13 @@ static void capture_configure_p4_csi_bridge(uint32_t hres, uint32_t vres)
     MIPI_CSI_BRIDGE.int_clr.val = 0x3fu;
 }
 
-/** RX is running — force bridge TX and wait briefly for dma_done. */
-static bool arm_tx_and_wait_frames(capture_ctx_t *c, int wait_ms)
-{
-    uint32_t before = c->csi_dma_done_irqs;
-    (void)tc358743_arm_csi_tx(c->tc);
-    capture_configure_p4_csi_bridge(c->hres, c->vres);
-    int waited = 0;
-    while (waited < wait_ms) {
-        if (c->csi_dma_done_irqs > before) {
-            ESP_LOGI(CAPTURE_LOG_TAG, "first DMA frame after %d ms (done=%" PRIu32 ")",
-                     waited, c->csi_dma_done_irqs);
-            return true;
-        }
-        vTaskDelay(pdMS_TO_TICKS(50));
-        waited += 50;
-        if ((waited % 400) == 0) {
-            (void)tc358743_arm_csi_tx(c->tc);
-        }
-    }
-    ESP_LOGW(CAPTURE_LOG_TAG, "no DMA after %d ms (done=%" PRIu32 ")",
-             wait_ms, c->csi_dma_done_irqs);
-    return false;
-}
-
 void capture_debug_csi_timeout(capture_ctx_t *c, unsigned bpp, size_t fb_bytes)
 {
     ESP_LOGW(CAPTURE_LOG_TAG, "CSI stall done=%" PRIu32 " get_new=%" PRIu32 " fb=%zu bpp=%u",
              c->csi_dma_done_irqs, c->csi_get_new_irqs, fb_bytes, bpp);
-    {
-        uint32_t brg_fc = MIPI_CSI_BRIDGE.frame_cfg.val;
-        uint32_t dtc = MIPI_CSI_BRIDGE.data_type_cfg.val;
-        uint32_t ir = MIPI_CSI_BRIDGE.int_raw.val;
-        uint32_t ist = MIPI_CSI_BRIDGE.int_st.val;
-        ESP_LOGW(CAPTURE_LOG_TAG,
-                 "  BRG frame=0x%08" PRIx32 " hadr=%" PRIu32 " vadr=%" PRIu32
-                 " DT min=0x%02x max=0x%02x int_raw=0x%08" PRIx32 " int_st=0x%08" PRIx32,
-                 brg_fc, (brg_fc >> 12) & 0xfffu, brg_fc & 0xfffu,
-                 (unsigned)(dtc & 0x3fu), (unsigned)((dtc >> 8) & 0x3fu), ir, ist);
-    }
     if (c && c->tc) {
         tc358743_debug_status(c->tc);
         tc358743_debug_bridge(c->tc);
-        uint32_t h = 0, v = 0;
-        if (read_hdmi_timing(c->tc, &h, &v)) {
-            ESP_LOGW(CAPTURE_LOG_TAG, "stall timing HAct=%u VAct=%u (CSI %ux%u cam=%ux%u)",
-                     (unsigned)h, (unsigned)v, (unsigned)c->hres, (unsigned)c->vres,
-                     (unsigned)s_cam_h, (unsigned)s_cam_v);
-        }
     }
 }
 
@@ -277,12 +180,6 @@ static bool IRAM_ATTR cam_on_done(esp_cam_ctlr_handle_t h, esp_cam_ctlr_trans_t 
     (void)__sync_add_and_fetch(&c->csi_dma_done_irqs, 1);
     if (trans && trans->buffer) {
         c->done_fb = trans->buffer;
-        for (int i = 0; i < CAPTURE_FB_COUNT; i++) {
-            if (c->fb[i] == trans->buffer) {
-                c->done_fb_idx = i;
-                break;
-            }
-        }
     }
     BaseType_t woken = pdFALSE;
     if (c->csi_done_sem) {
@@ -310,8 +207,6 @@ static esp_err_t recreate_csi_at_size(capture_ctx_t *c, uint32_t hres, uint32_t 
 
     size_t need = (size_t)hres * (size_t)vres * 3u;
     if (need > c->fb_alloc_bytes) {
-        ESP_LOGE(CAPTURE_LOG_TAG, "recreate: %ux%u needs %zu > alloc %zu", (unsigned)hres,
-                 (unsigned)vres, need, c->fb_alloc_bytes);
         return ESP_ERR_NO_MEM;
     }
     c->hres = hres;
@@ -370,21 +265,19 @@ static esp_err_t recreate_csi_at_size(capture_ctx_t *c, uint32_t hres, uint32_t 
     s_isp_created = true;
     ISP.cntl.isp_en = 0;
     capture_configure_p4_csi_bridge(hres, vres);
-    ESP_LOGI(CAPTURE_LOG_TAG, "CSI recreated at %ux%u", (unsigned)hres, (unsigned)vres);
     return ESP_OK;
 }
 
 static esp_err_t hard_hpd_recover(capture_ctx_t *c)
 {
     int64_t now = (int64_t)esp_timer_get_time();
-    if ((now - s_last_hpd_us) < (int64_t)5 * 1000000) {
-        ESP_LOGW(CAPTURE_LOG_TAG, "HPD rate-limited (<5s) — arm TX only");
-        (void)arm_tx_and_wait_frames(c, 800);
+    if ((now - s_last_hpd_us) < (int64_t)8 * 1000000) {
+        (void)tc358743_arm_csi_tx(c->tc);
         return ESP_ERR_INVALID_STATE;
     }
     s_last_hpd_us = now;
 
-    ESP_LOGW(CAPTURE_LOG_TAG, "CSI hard recover: full HPD (boot path)");
+    ESP_LOGW(CAPTURE_LOG_TAG, "HPD recover");
 
     if (s_cam_started && s_cam) {
         (void)esp_cam_ctlr_stop(s_cam);
@@ -393,49 +286,33 @@ static esp_err_t hard_hpd_recover(capture_ctx_t *c)
     drain_done_sem(c);
     c->ping_fb_idx = 0;
     c->done_fb = NULL;
-    c->done_fb_idx = -1;
 
     (void)tc358743_hdmi_hotplug_reset(c->tc);
     wait_hdmi_lock(c->tc, 5000);
-
     if (!tc_locked(c->tc)) {
-        ESP_LOGW(CAPTURE_LOG_TAG, "recover: still unlocked after HPD");
-        (void)tc358743_arm_csi_tx(c->tc);
         return ESP_ERR_INVALID_STATE;
     }
 
     uint32_t h = c->hres, v = c->vres;
     (void)read_hdmi_timing(c->tc, &h, &v);
-
     if (h != s_cam_h || v != s_cam_v) {
-        ESP_LOGI(CAPTURE_LOG_TAG, "source resolution change %ux%u → %ux%u",
-                 (unsigned)s_cam_h, (unsigned)s_cam_v, (unsigned)h, (unsigned)v);
         esp_err_t er = recreate_csi_at_size(c, h, v);
         if (er != ESP_OK) {
-            ESP_LOGE(CAPTURE_LOG_TAG, "CSI recreate failed %s", esp_err_to_name(er));
             return er;
         }
     } else {
-        c->hres = h;
-        c->vres = v;
         c->frame_bytes = (size_t)h * (size_t)v * 3u;
         capture_configure_p4_csi_bridge(h, v);
     }
 
     ISP.cntl.isp_en = 0;
     MIPI_CSI_BRIDGE.int_clr.val = 0x3fu;
-    capture_configure_p4_csi_bridge(c->hres, c->vres);
     esp_err_t er = esp_cam_ctlr_start(s_cam);
     if (er != ESP_OK) {
-        ESP_LOGE(CAPTURE_LOG_TAG, "CSI recover: cam start failed %s", esp_err_to_name(er));
         return er;
     }
     s_cam_started = true;
-
-    /* RX first, then TX — same as cold boot. */
-    (void)arm_tx_and_wait_frames(c, 1500);
-    ESP_LOGI(CAPTURE_LOG_TAG, "CSI recover: cam restarted %ux%u",
-             (unsigned)c->hres, (unsigned)c->vres);
+    (void)tc358743_arm_csi_tx(c->tc);
     return ESP_OK;
 }
 
@@ -463,37 +340,18 @@ capture_ctx_t *capture_hw_init_start(void)
     };
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus));
 
-    i2c_bus_scan(i2c_bus);
     if (!tc358743_present(i2c_bus)) {
-        ESP_LOGE(CAPTURE_LOG_TAG,
-                 "FATAL: TC358743 not responding at 0x0F after RESET. CSI will not be started.");
+        ESP_LOGE(CAPTURE_LOG_TAG, "TC358743 not found");
         vTaskDelete(NULL);
         return NULL;
     }
 
     ESP_ERROR_CHECK(tc358743_probe(i2c_bus, NULL, &s_cap.tc));
     ESP_ERROR_CHECK(tc358743_init_streaming(s_cap.tc));
-    tc358743_log_link_state(s_cap.tc);
 
-    {
-        uint16_t id = 0;
-        (void)tc358743_read_chip_id(s_cap.tc, &id);
-        if ((id & 0xffu) == ((id >> 8) & 0xffu) && (id & 0xffu) != 0) {
-            ESP_LOGE(CAPTURE_LOG_TAG, "CHIPID mono-fill 0x%04x after successful probe — aborting", id);
-            vTaskDelete(NULL);
-            return NULL;
-        }
-        ESP_LOGI(CAPTURE_LOG_TAG, "TC358743 CHIPID=0x%04x (ok)", id);
-    }
-
-    ESP_ERROR_CHECK(tc358743_enable_hdmi_output(s_cap.tc));
-    wait_hdmi_lock(s_cap.tc, 5000);
-    if (!tc_locked(s_cap.tc)) {
-        (void)tc358743_hdmi_hotplug_reset(s_cap.tc);
-        wait_hdmi_lock(s_cap.tc, 5000);
-    }
-
-    resolve_capture_size(s_cap.tc, &s_cap.hres, &s_cap.vres);
+    /* Default size until lock; p4kvm often uses fixed — we refine after HPD. */
+    s_cap.hres = 720;
+    s_cap.vres = 480;
     s_cap.frame_bytes = (size_t)s_cap.hres * (size_t)s_cap.vres * 3u;
     s_cap.fb_alloc_bytes = (size_t)CAPTURE_MAX_H * (size_t)CAPTURE_MAX_V * 3u;
     s_cam_h = s_cap.hres;
@@ -504,8 +362,7 @@ capture_ctx_t *capture_hw_init_start(void)
     uint8_t *blk = heap_caps_aligned_calloc(align, CAPTURE_FB_COUNT, s_cap.fb_alloc_bytes,
                                             MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!blk) {
-        ESP_LOGE(CAPTURE_LOG_TAG, "FB alloc fail (max %ux%u RGB888 x%d)", CAPTURE_MAX_H, CAPTURE_MAX_V,
-                 CAPTURE_FB_COUNT);
+        ESP_LOGE(CAPTURE_LOG_TAG, "FB alloc fail");
         vTaskDelete(NULL);
         return NULL;
     }
@@ -522,10 +379,6 @@ capture_ctx_t *capture_hw_init_start(void)
         vTaskDelete(NULL);
         return NULL;
     }
-
-    ESP_LOGI(CAPTURE_LOG_TAG, "MIPI lane %u Mbps RGB888 DT=0x24 active=%ux%u fb=%d",
-             (unsigned)P4KVM_MIPI_LANE_MBPS, (unsigned)s_cap.hres, (unsigned)s_cap.vres,
-             CAPTURE_FB_COUNT);
 
     esp_cam_ctlr_csi_config_t csi_cfg = {
         .ctlr_id = 0,
@@ -566,14 +419,23 @@ capture_ctx_t *capture_hw_init_start(void)
     ISP.cntl.isp_en = 0;
     capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
 
-    /* 1) P4 CSI RX up  2) arm bridge TX  3) wait for first frame */
+    /* p4kvm: enable HDMI *after* cam enable, then wait lock, then start. */
+    ESP_ERROR_CHECK(tc358743_enable_hdmi_output(s_cap.tc));
+    wait_hdmi_lock(s_cap.tc, 5000);
+
+    uint32_t h = s_cap.hres, v = s_cap.vres;
+    if (read_hdmi_timing(s_cap.tc, &h, &v) && (h != s_cap.hres || v != s_cap.vres)) {
+        ESP_LOGI(CAPTURE_LOG_TAG, "timing %ux%u → recreate CSI", (unsigned)h, (unsigned)v);
+        ESP_ERROR_CHECK(recreate_csi_at_size(&s_cap, h, v));
+    }
+
+    capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
     ESP_ERROR_CHECK(esp_cam_ctlr_start(s_cam));
     s_cam_started = true;
-    (void)arm_tx_and_wait_frames(&s_cap, 1500);
+    (void)tc358743_arm_csi_tx(s_cap.tc);
 
-    ESP_LOGI(CAPTURE_LOG_TAG, "CSI started %ux%u RGB888 frame=%zu lane=%uMbps DT=0x24",
-             (unsigned)s_cap.hres, (unsigned)s_cap.vres, s_cap.frame_bytes,
-             (unsigned)P4KVM_MIPI_LANE_MBPS);
+    ESP_LOGI(CAPTURE_LOG_TAG, "CSI started %ux%u (p4kvm order)", (unsigned)s_cap.hres,
+             (unsigned)s_cap.vres);
     return &s_cap;
 }
 
