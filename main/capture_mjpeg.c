@@ -2,8 +2,12 @@
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * RGB888 CSI → optional SPIRAM scratch → HW JPEG.
- * Scratch is sized to the *active* frame, not max 1080p (that OOMed at 6.2 MB).
+ * Hands-off while CSI delivers real pixels. Only recover on true death:
+ *   - no DMA frames for several seconds, OR
+ *   - sustained blank (0x80) fill while DMA still advances
+ *
+ * Do NOT periodically rewrite TC358743 registers — that is what turned a
+ * healthy boot stream into permanent blank fill after ~10–15 s.
  */
 #include "capture_priv.h"
 
@@ -31,10 +35,13 @@ static uint8_t *s_encode_scratch;
 static size_t s_encode_scratch_bytes;
 
 #ifndef BABELBUS_TARGET_FPS
-#define BABELBUS_TARGET_FPS 25
+#define BABELBUS_TARGET_FPS 20
 #endif
 
-/** Reject mid-grey CSI fill (every sample ~0x80 → sum ≈ 128*256). */
+/* ~2 s of blank at 20 fps before full HPD recover */
+#define BLANK_STREAK_BEFORE_RECOVER 40
+
+/** Mid-grey CSI fill: 256 samples of ~0x80 → sum ≈ 32768. */
 static bool frame_looks_blank_fill(const uint8_t *p, size_t nbytes)
 {
     if (!p || nbytes < 256) {
@@ -51,7 +58,6 @@ static bool frame_looks_blank_fill(const uint8_t *p, size_t nbytes)
     return (sum > 32000u && sum < 33536u);
 }
 
-/** Grow/shrink scratch to match active frame. Never fatal. */
 static void encode_scratch_ensure(size_t need)
 {
     if (need == 0) {
@@ -73,8 +79,7 @@ static void encode_scratch_ensure(size_t need)
         s_encode_scratch_bytes = need;
         ESP_LOGI(CAPTURE_LOG_TAG, "encode scratch %zu bytes", need);
     } else {
-        ESP_LOGW(CAPTURE_LOG_TAG,
-                 "encode scratch alloc failed (%zu) — encoding DMA buffer in place",
+        ESP_LOGW(CAPTURE_LOG_TAG, "encode scratch alloc failed (%zu) — inplace",
                  need);
     }
 }
@@ -120,36 +125,35 @@ void capture_mjpeg_run(capture_ctx_t *c)
         return;
     }
 
-    /* Active-frame scratch only (720×480 ≈ 1 MB; not 6.2 MB max). */
     encode_scratch_ensure(c->frame_bytes);
 
-    ESP_LOGI(CAPTURE_LOG_TAG, "MJPEG ready q=%u fps=%d frame=%zu scratch=%s",
+    ESP_LOGI(CAPTURE_LOG_TAG, "MJPEG ready q=%u fps=%d frame=%zu scratch=%s (hands-off bridge)",
              (unsigned)g_jpeg_frame.jpeg_quality, BABELBUS_TARGET_FPS, c->frame_bytes,
              s_encode_scratch ? "ok" : "inplace");
 
     const unsigned bpp = capture_csi_bpp();
-    int64_t hdmi_recover_cooldown_until_us = 0;
+    int64_t recover_cooldown_until_us = 0;
     uint32_t last_logged_done = 0;
     int64_t last_encode_us = 0;
-    int64_t last_keepalive_us = 0;
+    int blank_streak = 0;
     const int64_t min_encode_interval_us = (int64_t)(1000000 / BABELBUS_TARGET_FPS);
-    const int64_t keepalive_interval_us = (int64_t)3000000;
 
     while (1) {
-        if (xSemaphoreTake(c->csi_done_sem, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        /* 4 s with zero DMA → real stall (not blank-fill, which still gives sem). */
+        if (xSemaphoreTake(c->csi_done_sem, pdMS_TO_TICKS(4000)) != pdTRUE) {
             ESP_LOGW(CAPTURE_LOG_TAG, "csi frame wait timeout (dma_done_irqs=%lu)",
                      (unsigned long)c->csi_dma_done_irqs);
             capture_debug_csi_timeout(c, bpp, c->frame_bytes);
             int64_t now = (int64_t)esp_timer_get_time();
-            if (now >= hdmi_recover_cooldown_until_us) {
+            if (now >= recover_cooldown_until_us) {
+                ESP_LOGW(CAPTURE_LOG_TAG, "DMA dead — full HPD recover (boot path)");
                 (void)capture_hw_hdmi_recover(c);
-                hdmi_recover_cooldown_until_us = now + (int64_t)4 * 1000000;
-                /* Resolution may have changed during recover. */
+                recover_cooldown_until_us = now + (int64_t)6 * 1000000;
                 encode_scratch_ensure(c->frame_bytes);
+                blank_streak = 0;
             }
             continue;
         }
-        hdmi_recover_cooldown_until_us = 0;
         while (xSemaphoreTake(c->csi_done_sem, 0) == pdTRUE) {
         }
 
@@ -161,12 +165,14 @@ void capture_mjpeg_run(capture_ctx_t *c)
 
         int64_t now = (int64_t)esp_timer_get_time();
 
-        if ((now - last_keepalive_us) >= keepalive_interval_us) {
-            (void)tc358743_csi_keepalive(c->tc);
-            last_keepalive_us = now;
-        }
+        /*
+         * NO periodic tc358743_csi_keepalive here.
+         * Clock-kick / VBUFEN rewrite while live was turning real video into
+         * permanent 0x80 fill after ~10–15 s (dma_done kept climbing).
+         */
 
         if (jpeg_frame_stream_client_count() <= 0) {
+            blank_streak = 0;
             continue;
         }
 
@@ -194,13 +200,29 @@ void capture_mjpeg_run(capture_ctx_t *c)
         }
 
         if (frame_looks_blank_fill(enc_src, nbytes)) {
-            if ((c->csi_dma_done_irqs - last_logged_done) >= 150u) {
-                ESP_LOGW(CAPTURE_LOG_TAG, "skip blank CSI fill done=%lu",
-                         (unsigned long)c->csi_dma_done_irqs);
-                last_logged_done = c->csi_dma_done_irqs;
+            blank_streak++;
+            if ((blank_streak % 30) == 1) {
+                ESP_LOGW(CAPTURE_LOG_TAG, "blank CSI fill done=%lu streak=%d",
+                         (unsigned long)c->csi_dma_done_irqs, blank_streak);
+            }
+            /*
+             * Blank while DMA advances is the boot-only failure mode:
+             * video path muted/fill, stall timeout never trips.
+             * Full HPD is the only thing that restored real pixels.
+             */
+            if (blank_streak >= BLANK_STREAK_BEFORE_RECOVER &&
+                now >= recover_cooldown_until_us) {
+                ESP_LOGW(CAPTURE_LOG_TAG,
+                         "sustained blank fill (streak=%d) — full HPD recover",
+                         blank_streak);
+                (void)capture_hw_hdmi_recover(c);
+                recover_cooldown_until_us = now + (int64_t)6 * 1000000;
+                encode_scratch_ensure(c->frame_bytes);
+                blank_streak = 0;
             }
             continue;
         }
+        blank_streak = 0;
 
         if (c->csi_dma_done_irqs == 1 ||
             (c->csi_dma_done_irqs - last_logged_done) >= 300u) {

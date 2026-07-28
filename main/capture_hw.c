@@ -2,10 +2,8 @@
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * Recover policy:
- *   1) soft_kick
- *   2) CTXRST rearm (no HPD)
- *   3) After streak >= 3 with zero frames: full HPD even if SYS_STATUS locked
+ * Recover = boot path only (full HPD + cam restart).
+ * soft_kick / CTXRST-without-HPD never cleared TxAct=0 / blank fill in the field.
  */
 #include "capture_priv.h"
 
@@ -51,10 +49,7 @@ static const uint32_t s_csi_expected_dt = 0x24u;
 static capture_ctx_t s_cap;
 static uint32_t s_cam_h;
 static uint32_t s_cam_v;
-static int s_soft_fail_streak;
 static int64_t s_last_hpd_us;
-
-#define SOFT_FAIL_BEFORE_HPD 3
 
 static void tc358743_resetn_pulse(void)
 {
@@ -258,7 +253,6 @@ static bool IRAM_ATTR cam_on_done(esp_cam_ctlr_handle_t h, esp_cam_ctlr_trans_t 
     (void)__sync_add_and_fetch(&c->csi_dma_done_irqs, 1);
     if (trans && trans->buffer) {
         c->done_fb = trans->buffer;
-        /* Map pointer back to index for diagnostics */
         for (int i = 0; i < CAPTURE_FB_COUNT; i++) {
             if (c->fb[i] == trans->buffer) {
                 c->done_fb_idx = i;
@@ -352,64 +346,21 @@ static esp_err_t recreate_csi_at_size(capture_ctx_t *c, uint32_t hres, uint32_t 
     s_isp_created = true;
     ISP.cntl.isp_en = 0;
     capture_configure_p4_csi_bridge(hres, vres);
-    ESP_LOGI(CAPTURE_LOG_TAG, "CSI recreated at %ux%u (fb=%d)", (unsigned)hres, (unsigned)vres,
-             CAPTURE_FB_COUNT);
+    ESP_LOGI(CAPTURE_LOG_TAG, "CSI recreated at %ux%u", (unsigned)hres, (unsigned)vres);
     return ESP_OK;
 }
 
-static bool wait_new_frames(capture_ctx_t *c, uint32_t done_before, int loops)
-{
-    for (int i = 0; i < loops; i++) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-        if (c->csi_dma_done_irqs > done_before) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static esp_err_t soft_or_rearm_while_locked(capture_ctx_t *c)
-{
-    uint32_t done_before = c->csi_dma_done_irqs;
-
-    ESP_LOGW(CAPTURE_LOG_TAG, "soft_kick (locked, no HPD)");
-    (void)tc358743_soft_kick(c->tc);
-    MIPI_CSI_BRIDGE.int_clr.val = 0x3fu;
-    if (wait_new_frames(c, done_before, 20)) {
-        s_soft_fail_streak = 0;
-        ESP_LOGI(CAPTURE_LOG_TAG, "soft_kick OK done %" PRIu32 "→%" PRIu32, done_before,
-                 c->csi_dma_done_irqs);
-        return ESP_OK;
-    }
-
-    done_before = c->csi_dma_done_irqs;
-    ESP_LOGW(CAPTURE_LOG_TAG, "CTXRST rearm (locked, no HPD, cam stays up)");
-    (void)tc358743_csi_rearm(c->tc);
-    MIPI_CSI_BRIDGE.int_clr.val = 0x3fu;
-    if (wait_new_frames(c, done_before, 30)) {
-        s_soft_fail_streak = 0;
-        ESP_LOGI(CAPTURE_LOG_TAG, "rearm OK done %" PRIu32 "→%" PRIu32, done_before,
-                 c->csi_dma_done_irqs);
-        return ESP_OK;
-    }
-
-    s_soft_fail_streak++;
-    ESP_LOGW(CAPTURE_LOG_TAG, "soft+rearm no frames (streak=%d)", s_soft_fail_streak);
-    (void)tc358743_soft_kick(c->tc);
-    return ESP_ERR_TIMEOUT;
-}
-
+/** Full boot-equivalent recover. Rate-limited to avoid HPD storms. */
 static esp_err_t hard_hpd_recover(capture_ctx_t *c)
 {
     int64_t now = (int64_t)esp_timer_get_time();
-    if ((now - s_last_hpd_us) < (int64_t)8 * 1000000) {
-        ESP_LOGW(CAPTURE_LOG_TAG, "HPD rate-limited — soft only");
-        return soft_or_rearm_while_locked(c);
+    if ((now - s_last_hpd_us) < (int64_t)5 * 1000000) {
+        ESP_LOGW(CAPTURE_LOG_TAG, "HPD rate-limited (<5s)");
+        return ESP_ERR_INVALID_STATE;
     }
     s_last_hpd_us = now;
-    s_soft_fail_streak = 0;
 
-    ESP_LOGW(CAPTURE_LOG_TAG, "CSI hard recover: HPD");
+    ESP_LOGW(CAPTURE_LOG_TAG, "CSI hard recover: full HPD (boot path)");
 
     if (s_cam_started && s_cam) {
         (void)esp_cam_ctlr_stop(s_cam);
@@ -610,20 +561,6 @@ capture_ctx_t *capture_hw_init_start(void)
 esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
 {
     ESP_RETURN_ON_FALSE(c && c->tc, ESP_ERR_INVALID_ARG, CAPTURE_LOG_TAG, "ctx");
-
-    if (tc_locked(c->tc)) {
-        esp_err_t soft = soft_or_rearm_while_locked(c);
-        if (soft == ESP_OK) {
-            return ESP_OK;
-        }
-        if (s_soft_fail_streak >= SOFT_FAIL_BEFORE_HPD) {
-            ESP_LOGW(CAPTURE_LOG_TAG,
-                     "streak=%d with zero frames despite lock — forcing HPD",
-                     s_soft_fail_streak);
-            return hard_hpd_recover(c);
-        }
-        return soft;
-    }
-
+    /* Always full HPD — soft_kick/CTXRST never restored real pixels in the field. */
     return hard_hpd_recover(c);
 }
