@@ -2,10 +2,10 @@
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * Matched to jrowny/p4kvm + Linux tc358743:
- *   TXOPTIONCNTRL = 0 (non-continuous)
- *   VI_MUTE = AUTO_MUTE (0xc0) when streaming
- *   enable_hdmi_output: stream on → HPD high → CSI_START
+ * Waveshare ESP32-P4 + DVI sources (HDMI bit=0 in SYS_STATUS):
+ *   VI_MUTE=0 (full unmute) — AUTO_MUTE 0xc0 produces solid green
+ *   CONTCLKMODE=1 — required for stable CSI RX on this board
+ * p4kvm's AUTO_MUTE + non-continuous path is for true HDMI sources.
  */
 #include "tc358743.h"
 
@@ -338,6 +338,16 @@ static void sleep_mode(tc358743_t *d, bool enable)
     wr16_and_or(d, SYSCTL, (uint16_t)~MASK_SLEEP, enable ? MASK_SLEEP : 0);
 }
 
+/** LP11 → continuous HS clock. Required on Waveshare P4 RX. */
+static void csi_clock_kick(tc358743_t *d)
+{
+    wr32(d, TXOPTIONCNTRL, 0);
+    wr32(d, CSI_START, MASK_STRT);
+    vTaskDelay(pdMS_TO_TICKS(1));
+    wr32(d, TXOPTIONCNTRL, MASK_CONTCLKMODE);
+    wr32(d, CSI_START, MASK_STRT);
+}
+
 static void apply_hdmi_or_dvi(tc358743_t *d)
 {
     uint8_t st = rd8(d, SYS_STATUS);
@@ -345,16 +355,23 @@ static void apply_hdmi_or_dvi(tc358743_t *d)
     if (hdmi) {
         wr8_and_or(d, VI_MODE, (uint8_t)~MASK_RGB_DVI, 0);
     } else {
+        /* DVI / DVD: HDMI bit clear — force RGB_DVI mode. */
         wr8_and_or(d, VI_MODE, (uint8_t)~MASK_RGB_DVI, MASK_RGB_DVI);
     }
 }
 
-/** p4kvm: AUTO_MUTE on, no continuous-clock kick. */
+/**
+ * Stream on: VI_MUTE=0 (full unmute).
+ * AUTO_MUTE (0xc0) = solid green on DVI sources (SYS HDMI=0).
+ */
 static void enable_stream(tc358743_t *d, bool enable)
 {
     if (enable) {
-        wr8(d, VI_MUTE, MASK_AUTO_MUTE);
+        apply_hdmi_or_dvi(d);
+        csi_clock_kick(d);
+        wr8(d, VI_MUTE, 0x00);
         wr16_and_or(d, CONFCTL, (uint16_t) ~(MASK_VBUFEN | MASK_ABUFEN), MASK_VBUFEN | MASK_ABUFEN);
+        wr32(d, CSI_START, MASK_STRT);
     } else {
         wr8(d, VI_MUTE, MASK_AUTO_MUTE | MASK_VI_MUTE);
         wr16_and_or(d, CONFCTL, (uint16_t) ~(MASK_VBUFEN | MASK_ABUFEN), 0);
@@ -482,7 +499,7 @@ static void initial_setup(tc358743_t *d)
     set_hdmi_hdcp(d, pdata->enable_hdcp);
     set_hdmi_audio(d);
     set_hdmi_info_frame(d);
-    wr8_and_or(d, VI_MODE, (uint8_t)~MASK_RGB_DVI, 0);
+    wr8_and_or(d, VI_MODE, (uint8_t)~MASK_RGB_DVI, MASK_RGB_DVI); /* default DVI-friendly */
     wr8_and_or(d, VOUT_SET2, (uint8_t)~MASK_VOUTCOLORMODE, MASK_VOUTCOLORMODE_AUTO);
     wr8(d, VOUT_SET3, MASK_VOUT_EXTCNT);
 }
@@ -520,7 +537,6 @@ void tc358743_set_csi_uyvy422(tc358743_t *d, bool uyvy422)
     apply_csi_color_space(d);
 }
 
-/** p4kvm: TXOPTIONCNTRL=0 always (non-continuous). */
 static void set_csi_lanes(tc358743_t *d, unsigned lanes)
 {
     tc358743_cfg_t *pdata = &d->cfg;
@@ -552,6 +568,9 @@ static void set_csi_lanes(tc358743_t *d, unsigned lanes)
     wr32(d, CSI_CONFW, MASK_MODE_SET | MASK_ADDRESS_CSI_ERR_INTENA | MASK_TXBRK | MASK_QUNK | MASK_WCER | MASK_INER);
     wr32(d, CSI_CONFW, MASK_MODE_CLEAR | MASK_ADDRESS_CSI_ERR_HALT | MASK_TXBRK | MASK_QUNK);
     wr32(d, CSI_CONFW, MASK_MODE_SET | MASK_ADDRESS_CSI_INT_ENA | MASK_INTER);
+    /* Continuous clock for Waveshare P4 CSI RX. */
+    wr32(d, TXOPTIONCNTRL, MASK_CONTCLKMODE);
+    wr32(d, CSI_START, MASK_STRT);
 }
 
 static void hpd_set(tc358743_t *d, bool on)
@@ -642,11 +661,11 @@ esp_err_t tc358743_enable_hdmi_output(tc358743_t *d)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
     enable_stream(d, true);
-    vTaskDelay(pdMS_TO_TICKS(150));
+    vTaskDelay(pdMS_TO_TICKS(100));
     hpd_set(d, true);
     vTaskDelay(pdMS_TO_TICKS(50));
-    wr32(d, CSI_START, MASK_STRT);
-    ESP_LOGI(TAG, "HPD armed VI_MUTE=AUTO_MUTE TXOPT=0 (p4kvm)");
+    enable_stream(d, true);
+    ESP_LOGI(TAG, "HPD armed VI_MUTE=0 CONTCLK=1 (Waveshare/DVI)");
     tc358743_debug_status(d);
     return ESP_OK;
 }
@@ -667,7 +686,6 @@ esp_err_t tc358743_reapply_csi_path_after_hdmi(tc358743_t *d)
     apply_csi_color_space(d);
     set_csi_lanes(d, d->cfg.lanes);
     enable_stream(d, true);
-    wr32(d, CSI_START, MASK_STRT);
     return ESP_OK;
 }
 
@@ -675,7 +693,6 @@ esp_err_t tc358743_soft_kick(tc358743_t *d)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
     enable_stream(d, true);
-    wr32(d, CSI_START, MASK_STRT);
     return ESP_OK;
 }
 
@@ -695,7 +712,6 @@ esp_err_t tc358743_arm_csi_tx(tc358743_t *d)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
     enable_stream(d, true);
-    wr32(d, CSI_START, MASK_STRT);
     return ESP_OK;
 }
 
@@ -720,8 +736,5 @@ esp_err_t tc358743_set_streaming(tc358743_t *d, bool on)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
     enable_stream(d, on);
-    if (on) {
-        wr32(d, CSI_START, MASK_STRT);
-    }
     return ESP_OK;
 }
