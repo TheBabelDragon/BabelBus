@@ -337,7 +337,6 @@ static void sleep_mode(tc358743_t *d, bool enable)
     wr16_and_or(d, SYSCTL, (uint16_t)~MASK_SLEEP, enable ? MASK_SLEEP : 0);
 }
 
-/** LP11 → continuous HS clock. Required on Waveshare P4 RX. */
 static void csi_clock_kick(tc358743_t *d)
 {
     wr32(d, TXOPTIONCNTRL, 0);
@@ -358,13 +357,14 @@ static void apply_hdmi_or_dvi(tc358743_t *d)
     }
 }
 
-/** Stream on: VI_MUTE=0 (full unmute). AUTO_MUTE caused green/blank on this board. */
 static void enable_stream(tc358743_t *d, bool enable)
 {
     if (enable) {
         csi_clock_kick(d);
         wr8(d, VI_MUTE, 0x00);
         wr16_and_or(d, CONFCTL, (uint16_t) ~(MASK_VBUFEN | MASK_ABUFEN), MASK_VBUFEN | MASK_ABUFEN);
+        /* Extra CSI_START after VBUFEN — TxAct stays 0 without this on some boots. */
+        wr32(d, CSI_START, MASK_STRT);
     } else {
         wr8(d, VI_MUTE, MASK_AUTO_MUTE | MASK_VI_MUTE);
         wr16_and_or(d, CONFCTL, (uint16_t) ~(MASK_VBUFEN | MASK_ABUFEN), 0);
@@ -705,6 +705,18 @@ esp_err_t tc358743_csi_keepalive(tc358743_t *d)
 {
     ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
     enable_stream(d, true);
+    return ESP_OK;
+}
+
+esp_err_t tc358743_arm_csi_tx(tc358743_t *d)
+{
+    ESP_RETURN_ON_FALSE(d, ESP_ERR_INVALID_ARG, TAG, "dev");
+    /* Call after P4 CSI RX is started. No HPD, no CTXRST — just force TX. */
+    apply_hdmi_or_dvi(d);
+    enable_stream(d, true);
+    wr32(d, CSI_START, MASK_STRT);
+    vTaskDelay(pdMS_TO_TICKS(5));
+    wr32(d, CSI_START, MASK_STRT);
     return ESP_OK;
 }
 
