@@ -33,6 +33,13 @@ void jpeg_frame_stream_leave(void)
     taskEXIT_CRITICAL(&s_stream_mu);
 }
 
+void jpeg_frame_stream_force_clear(void)
+{
+    taskENTER_CRITICAL(&s_stream_mu);
+    s_stream_clients = 0;
+    taskEXIT_CRITICAL(&s_stream_mu);
+}
+
 int jpeg_frame_stream_client_count(void)
 {
     int n;

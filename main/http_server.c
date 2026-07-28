@@ -1,6 +1,9 @@
 /*
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
+ *
+ * On browser refresh the old /stream socket dies with errno 104/128.
+ * That is normal. We reclaim the stream lock so the new tab is not 503.
  */
 #include "http_server.h"
 
@@ -23,24 +26,10 @@
 
 static const char *TAG = "babelbus";
 
-static void stream_release_slot_ref(int slot)
-{
-    if (slot < 0 || slot >= JPEG_SLOT_COUNT) {
-        return;
-    }
-    if (xSemaphoreTake(g_jpeg_frame.mutex, portMAX_DELAY) == pdTRUE) {
-        if (g_jpeg_frame.slot_ref[slot] > 0) {
-            g_jpeg_frame.slot_ref[slot]--;
-        }
-        xSemaphoreGive(g_jpeg_frame.mutex);
-    }
-}
-
 #define STREAM_WORKER_STACK (12 * 1024)
 #define STREAM_WORKER_PRIO (tskIDLE_PRIORITY + 7)
 #define AUDIO_WORKER_STACK (8 * 1024)
 #define AUDIO_CHUNK 2048
-/* Scratch for one JPEG so encoder slots free during TCP send. */
 #define STREAM_COPY_CAP (512 * 1024)
 
 extern const char index_html_start[] asm("_binary_index_html_start");
@@ -134,7 +123,7 @@ static void stream_worker_task(void *arg)
                 }
                 continue;
             }
-            if (xSemaphoreTake(g_jpeg_frame.frame_ready_sem, pdMS_TO_TICKS(200)) != pdTRUE) {
+            if (xSemaphoreTake(g_jpeg_frame.frame_ready_sem, pdMS_TO_TICKS(150)) != pdTRUE) {
                 if (stream_peer_disconnected(req)) {
                     stop = true;
                     break;
@@ -150,7 +139,7 @@ static void stream_worker_task(void *arg)
 
         size_t copy_len = 0;
         uint32_t seq_snap = last_seq;
-        if (xSemaphoreTake(g_jpeg_frame.mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        if (xSemaphoreTake(g_jpeg_frame.mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
             continue;
         }
         int f = g_jpeg_frame.front_idx;
@@ -184,7 +173,6 @@ static void stream_worker_task(void *arg)
             break;
         }
 
-        /* Send from private copy — encoder never blocked by TCP. */
         esp_err_t se = httpd_resp_send_chunk(req, hdr, hl);
         if (se == ESP_OK) {
             se = httpd_resp_send_chunk(req, (const char *)copy, copy_len);
@@ -193,7 +181,8 @@ static void stream_worker_task(void *arg)
             se = httpd_resp_send_chunk(req, "\r\n", 2);
         }
         if (se != ESP_OK) {
-            break; /* refresh/close — expected */
+            /* errno 104/128 on refresh — expected, not a bug */
+            break;
         }
         last_seq = seq_snap;
     }
@@ -211,10 +200,17 @@ static esp_err_t stream_get(httpd_req_t *req)
         !g_jpeg_frame.xmit_mutex || !g_jpeg_frame.frame_ready_sem) {
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "camera starting");
     }
-    /* One live viewer — extra tabs get 503 instead of socket spam. */
+
+    /*
+     * Browser refresh kills the old socket (104/128) but the worker may not
+     * have left yet. Reclaim the lock so the new tab is not stuck on 503.
+     */
     if (jpeg_frame_stream_client_count() >= 1) {
-        return httpd_resp_send_custom_err(req, "503 Service Unavailable", "stream already open");
+        ESP_LOGW(TAG, "/stream: reclaiming stale client lock");
+        jpeg_frame_stream_force_clear();
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
+
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
     httpd_resp_set_hdr(req, "Pragma", "no-cache");
     httpd_resp_set_hdr(req, "Expires", "0");
