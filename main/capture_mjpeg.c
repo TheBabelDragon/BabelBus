@@ -1,6 +1,9 @@
 /*
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
+ *
+ * TC358743 MIPI RGB888 is byte-order BGR (Linux MEDIA_BUS_FMT_BGR888_1X24).
+ * ESP JPEG encoder expects RGB unless pixel_reverse is set.
  */
 #include "capture_priv.h"
 
@@ -33,7 +36,7 @@ void capture_mjpeg_run(capture_ctx_t *c)
     ESP_ERROR_CHECK(jpeg_new_encoder_engine(&jcfg, &s_jpeg_enc));
 
     if (g_jpeg_frame.jpeg_quality < 1u || g_jpeg_frame.jpeg_quality > 100u) {
-        g_jpeg_frame.jpeg_quality = 40u;
+        g_jpeg_frame.jpeg_quality = 45u;
     }
     jpeg_quality_load_from_nvs();
 
@@ -67,7 +70,7 @@ void capture_mjpeg_run(capture_ctx_t *c)
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(CAPTURE_LOG_TAG, "MJPEG ready q=%u target_fps=%d + CSI keepalive",
+    ESP_LOGI(CAPTURE_LOG_TAG, "MJPEG ready q=%u fps=%d BGR→JPEG (pixel_reverse)",
              (unsigned)g_jpeg_frame.jpeg_quality, BABELBUS_TARGET_FPS);
 
     const unsigned bpp = capture_csi_bpp();
@@ -76,17 +79,17 @@ void capture_mjpeg_run(capture_ctx_t *c)
     int64_t last_encode_us = 0;
     int64_t last_keepalive_us = 0;
     const int64_t min_encode_interval_us = (int64_t)(1000000 / BABELBUS_TARGET_FPS);
-    const int64_t keepalive_interval_us = (int64_t)1500000; /* 1.5 s */
+    const int64_t keepalive_interval_us = (int64_t)2000000;
 
     while (1) {
-        if (xSemaphoreTake(c->csi_done_sem, pdMS_TO_TICKS(1200)) != pdTRUE) {
+        if (xSemaphoreTake(c->csi_done_sem, pdMS_TO_TICKS(1500)) != pdTRUE) {
             ESP_LOGW(CAPTURE_LOG_TAG, "csi frame wait timeout (dma_done_irqs=%lu)",
                      (unsigned long)c->csi_dma_done_irqs);
             capture_debug_csi_timeout(c, bpp, c->frame_bytes);
             int64_t now = (int64_t)esp_timer_get_time();
             if (now >= hdmi_recover_cooldown_until_us) {
                 (void)capture_hw_hdmi_recover(c);
-                hdmi_recover_cooldown_until_us = now + (int64_t)2 * 1000000;
+                hdmi_recover_cooldown_until_us = now + (int64_t)3 * 1000000;
             }
             continue;
         }
@@ -101,7 +104,6 @@ void capture_mjpeg_run(capture_ctx_t *c)
 
         int64_t now = (int64_t)esp_timer_get_time();
 
-        /* Keep CSI TX alive without stopping the cam. */
         if ((now - last_keepalive_us) >= keepalive_interval_us) {
             (void)tc358743_csi_keepalive(c->tc);
             last_keepalive_us = now;
@@ -149,11 +151,19 @@ void capture_mjpeg_run(capture_ctx_t *c)
         } else if (q > 100u) {
             q = 100u;
         }
-        jpeg_encode_cfg_t enc = {.width = c->hres,
-                                 .height = c->vres,
-                                 .src_type = JPEG_ENCODE_IN_FORMAT_RGB888,
-                                 .sub_sample = JPEG_DOWN_SAMPLING_YUV420,
-                                 .image_quality = q};
+
+        /*
+         * TC358743 emits BGR888 on CSI (MIPI RGB888 = blue-first).
+         * pixel_reverse swaps R↔B for the HW JPEG encoder.
+         */
+        jpeg_encode_cfg_t enc = {
+            .width = c->hres,
+            .height = c->vres,
+            .src_type = JPEG_ENCODE_IN_FORMAT_RGB888,
+            .sub_sample = JPEG_DOWN_SAMPLING_YUV420,
+            .image_quality = q,
+            .pixel_reverse = true,
+        };
         uint32_t out_sz = 0;
         esp_err_t er = jpeg_encoder_process(s_jpeg_enc, &enc, src, (uint32_t)c->frame_bytes,
                                             g_jpeg_frame.jpeg_buf[back], (uint32_t)g_jpeg_frame.jpeg_cap,
