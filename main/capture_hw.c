@@ -2,9 +2,10 @@
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * Waveshare ESP32-P4-WIFI6-DEV-KIT Rev 1.1 + Waveshare HDMI to CSI Adapter
- * RGB888 CSI (DT 0x24).
- * Stall while HDMI locked → CTXRST rearm (no HPD). HPD only if unlocked.
+ * Waveshare ESP32-P4 + HDMI-CSI. RGB888 DT 0x24.
+ * While HDMI locked: soft_kick ONLY (no cam stop, no CTXRST).
+ * CTXRST/HPD only after soft fails repeatedly or unlock.
+ * 720x480 is the DVD source timing — not a software downscale.
  */
 #include "capture_priv.h"
 
@@ -50,7 +51,7 @@ static const uint32_t s_csi_expected_dt = 0x24u;
 static capture_ctx_t s_cap;
 static uint32_t s_cam_h;
 static uint32_t s_cam_v;
-static int s_rearm_fail_streak;
+static int s_soft_fail_streak;
 static int64_t s_last_hpd_us;
 
 static void tc358743_resetn_pulse(void)
@@ -160,11 +161,12 @@ static bool read_hdmi_timing(tc358743_t *tc, uint32_t *hres, uint32_t *vres)
 static void resolve_capture_size(tc358743_t *tc, uint32_t *hres, uint32_t *vres)
 {
     if (read_hdmi_timing(tc, hres, vres)) {
-        ESP_LOGI(CAPTURE_LOG_TAG, "CSI sized to HDMI timing %ux%u", (unsigned)*hres, (unsigned)*vres);
+        ESP_LOGI(CAPTURE_LOG_TAG, "CSI sized to HDMI source %ux%u (not downscale)",
+                 (unsigned)*hres, (unsigned)*vres);
     } else {
         *hres = 720u;
         *vres = 480u;
-        ESP_LOGW(CAPTURE_LOG_TAG, "CSI sized to fallback %ux%u (no valid HDMI timing)",
+        ESP_LOGW(CAPTURE_LOG_TAG, "CSI fallback %ux%u (no valid HDMI timing yet)",
                  (unsigned)*hres, (unsigned)*vres);
     }
 }
@@ -348,44 +350,24 @@ static esp_err_t recreate_csi_at_size(capture_ctx_t *c, uint32_t hres, uint32_t 
     return ESP_OK;
 }
 
-static esp_err_t rearm_stream(capture_ctx_t *c)
+/** Soft recover: no cam stop, no CTXRST. Just re-assert stream + continuous clock. */
+static esp_err_t soft_kick_only(capture_ctx_t *c)
 {
     uint32_t done_before = c->csi_dma_done_irqs;
-
-    if (s_cam_started && s_cam) {
-        (void)esp_cam_ctlr_stop(s_cam);
-        s_cam_started = false;
-    }
-    drain_done_sem(c);
-    c->ping_fb_idx = 0;
-    c->done_fb = NULL;
-
-    (void)tc358743_csi_rearm(c->tc);
-    ISP.cntl.isp_en = 0;
+    (void)tc358743_soft_kick(c->tc);
     MIPI_CSI_BRIDGE.int_clr.val = 0x3fu;
-    capture_configure_p4_csi_bridge(c->hres, c->vres);
 
-    vTaskDelay(pdMS_TO_TICKS(20));
-
-    esp_err_t er = esp_cam_ctlr_start(s_cam);
-    if (er != ESP_OK) {
-        ESP_LOGE(CAPTURE_LOG_TAG, "rearm cam start failed %s", esp_err_to_name(er));
-        return er;
-    }
-    s_cam_started = true;
-    (void)tc358743_set_streaming(c->tc, true);
-
-    for (int i = 0; i < 15; i++) {
-        vTaskDelay(pdMS_TO_TICKS(40));
+    for (int i = 0; i < 20; i++) {
+        vTaskDelay(pdMS_TO_TICKS(50));
         if (c->csi_dma_done_irqs > done_before) {
-            s_rearm_fail_streak = 0;
-            ESP_LOGI(CAPTURE_LOG_TAG, "rearm OK done %" PRIu32 "→%" PRIu32, done_before,
+            s_soft_fail_streak = 0;
+            ESP_LOGI(CAPTURE_LOG_TAG, "soft_kick OK done %" PRIu32 "→%" PRIu32, done_before,
                      c->csi_dma_done_irqs);
             return ESP_OK;
         }
     }
-    s_rearm_fail_streak++;
-    ESP_LOGW(CAPTURE_LOG_TAG, "rearm no new frames (streak=%d)", s_rearm_fail_streak);
+    s_soft_fail_streak++;
+    ESP_LOGW(CAPTURE_LOG_TAG, "soft_kick no frames (streak=%d)", s_soft_fail_streak);
     return ESP_ERR_TIMEOUT;
 }
 
@@ -534,25 +516,27 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
 {
     ESP_RETURN_ON_FALSE(c && c->tc, ESP_ERR_INVALID_ARG, CAPTURE_LOG_TAG, "ctx");
 
+    /* Path 1: HDMI still locked → soft_kick only. Never CTXRST here. */
     if (tc_locked(c->tc)) {
-        ESP_LOGW(CAPTURE_LOG_TAG, "CSI rearm (locked, no HPD) streak=%d", s_rearm_fail_streak);
-        if (rearm_stream(c) == ESP_OK) {
+        ESP_LOGW(CAPTURE_LOG_TAG, "CSI soft recover (locked) streak=%d", s_soft_fail_streak);
+        if (soft_kick_only(c) == ESP_OK) {
             return ESP_OK;
         }
-        if (s_rearm_fail_streak < 6) {
+        /* Soft failed a few times: still no CTXRST. Wait for HPD path. */
+        if (s_soft_fail_streak < 4) {
             return ESP_ERR_TIMEOUT;
         }
     }
 
     int64_t now = (int64_t)esp_timer_get_time();
-    if ((now - s_last_hpd_us) < (int64_t)8 * 1000000) {
-        ESP_LOGW(CAPTURE_LOG_TAG, "HPD rate-limited — retry rearm only");
-        return rearm_stream(c);
+    if ((now - s_last_hpd_us) < (int64_t)10 * 1000000) {
+        ESP_LOGW(CAPTURE_LOG_TAG, "HPD rate-limited — soft_kick only");
+        return soft_kick_only(c);
     }
     s_last_hpd_us = now;
-    s_rearm_fail_streak = 0;
+    s_soft_fail_streak = 0;
 
-    ESP_LOGW(CAPTURE_LOG_TAG, "CSI hard recover: HPD (unlocked or rearm exhausted)");
+    ESP_LOGW(CAPTURE_LOG_TAG, "CSI hard recover: HPD (unlocked or soft exhausted)");
 
     if (s_cam_started && s_cam) {
         (void)esp_cam_ctlr_stop(s_cam);
@@ -575,8 +559,8 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
     (void)read_hdmi_timing(c->tc, &h, &v);
 
     if (h != s_cam_h || v != s_cam_v) {
-        ESP_LOGI(CAPTURE_LOG_TAG, "resolution change %ux%u → %ux%u", (unsigned)s_cam_h,
-                 (unsigned)s_cam_v, (unsigned)h, (unsigned)v);
+        ESP_LOGI(CAPTURE_LOG_TAG, "source resolution change %ux%u → %ux%u",
+                 (unsigned)s_cam_h, (unsigned)s_cam_v, (unsigned)h, (unsigned)v);
         esp_err_t er = recreate_csi_at_size(c, h, v);
         if (er != ESP_OK) {
             ESP_LOGE(CAPTURE_LOG_TAG, "CSI recreate failed %s", esp_err_to_name(er));
