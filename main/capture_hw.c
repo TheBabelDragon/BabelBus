@@ -2,8 +2,7 @@
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * Boot order matched to jrowny/p4kvm:
- *   init_streaming → create/enable cam → enable_hdmi_output → wait lock → cam start
+ * Progressive recover — do not HPD on the first glitch (that caused grey-after-start).
  */
 #include "capture_priv.h"
 
@@ -50,6 +49,7 @@ static capture_ctx_t s_cap;
 static uint32_t s_cam_h;
 static uint32_t s_cam_v;
 static int64_t s_last_hpd_us;
+static int s_recover_streak;
 
 static void tc358743_resetn_pulse(void)
 {
@@ -271,13 +271,14 @@ static esp_err_t recreate_csi_at_size(capture_ctx_t *c, uint32_t hres, uint32_t 
 static esp_err_t hard_hpd_recover(capture_ctx_t *c)
 {
     int64_t now = (int64_t)esp_timer_get_time();
-    if ((now - s_last_hpd_us) < (int64_t)8 * 1000000) {
+    if ((now - s_last_hpd_us) < (int64_t)10 * 1000000) {
+        ESP_LOGW(CAPTURE_LOG_TAG, "HPD rate-limited — arm TX only");
         (void)tc358743_arm_csi_tx(c->tc);
         return ESP_ERR_INVALID_STATE;
     }
     s_last_hpd_us = now;
 
-    ESP_LOGW(CAPTURE_LOG_TAG, "HPD recover");
+    ESP_LOGW(CAPTURE_LOG_TAG, "PIPE action: HPD recover (streak=%d)", s_recover_streak);
 
     if (s_cam_started && s_cam) {
         (void)esp_cam_ctlr_stop(s_cam);
@@ -316,6 +317,34 @@ static esp_err_t hard_hpd_recover(capture_ctx_t *c)
     return ESP_OK;
 }
 
+void capture_hw_recover_streak_reset(void)
+{
+    if (s_recover_streak != 0) {
+        ESP_LOGI(CAPTURE_LOG_TAG, "recover streak cleared (was %d)", s_recover_streak);
+    }
+    s_recover_streak = 0;
+}
+
+esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
+{
+    ESP_RETURN_ON_FALSE(c && c->tc, ESP_ERR_INVALID_ARG, CAPTURE_LOG_TAG, "ctx");
+
+    s_recover_streak++;
+
+    if (s_recover_streak == 1) {
+        ESP_LOGW(CAPTURE_LOG_TAG, "PIPE action: soft arm_csi_tx (streak=1)");
+        return tc358743_arm_csi_tx(c->tc);
+    }
+    if (s_recover_streak == 2) {
+        ESP_LOGW(CAPTURE_LOG_TAG, "PIPE action: soft_kick (streak=2)");
+        (void)tc358743_soft_kick(c->tc);
+        return tc358743_arm_csi_tx(c->tc);
+    }
+
+    /* 3+ : full HPD */
+    return hard_hpd_recover(c);
+}
+
 capture_ctx_t *capture_hw_init_start(void)
 {
     esp_ldo_channel_handle_t ldo = NULL;
@@ -349,7 +378,6 @@ capture_ctx_t *capture_hw_init_start(void)
     ESP_ERROR_CHECK(tc358743_probe(i2c_bus, NULL, &s_cap.tc));
     ESP_ERROR_CHECK(tc358743_init_streaming(s_cap.tc));
 
-    /* Default size until lock; p4kvm often uses fixed — we refine after HPD. */
     s_cap.hres = 720;
     s_cap.vres = 480;
     s_cap.frame_bytes = (size_t)s_cap.hres * (size_t)s_cap.vres * 3u;
@@ -419,7 +447,6 @@ capture_ctx_t *capture_hw_init_start(void)
     ISP.cntl.isp_en = 0;
     capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
 
-    /* p4kvm: enable HDMI *after* cam enable, then wait lock, then start. */
     ESP_ERROR_CHECK(tc358743_enable_hdmi_output(s_cap.tc));
     wait_hdmi_lock(s_cap.tc, 5000);
 
@@ -433,14 +460,8 @@ capture_ctx_t *capture_hw_init_start(void)
     ESP_ERROR_CHECK(esp_cam_ctlr_start(s_cam));
     s_cam_started = true;
     (void)tc358743_arm_csi_tx(s_cap.tc);
+    s_recover_streak = 0;
 
-    ESP_LOGI(CAPTURE_LOG_TAG, "CSI started %ux%u (p4kvm order)", (unsigned)s_cap.hres,
-             (unsigned)s_cap.vres);
+    ESP_LOGI(CAPTURE_LOG_TAG, "CSI started %ux%u", (unsigned)s_cap.hres, (unsigned)s_cap.vres);
     return &s_cap;
-}
-
-esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
-{
-    ESP_RETURN_ON_FALSE(c && c->tc, ESP_ERR_INVALID_ARG, CAPTURE_LOG_TAG, "ctx");
-    return hard_hpd_recover(c);
 }
