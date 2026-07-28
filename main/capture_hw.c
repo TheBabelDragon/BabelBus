@@ -2,10 +2,11 @@
  * SPDX-FileCopyrightText: 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * Recover policy while HDMI locked:
- *   1) soft_kick (VBUFEN pulse + unmute + CONTCLK)
+ * Recover policy:
+ *   1) soft_kick (VBUFEN pulse + AUTO_MUTE stream-on)
  *   2) CTXRST rearm (no HPD, cam stays running)
- * HPD only when unlocked. No more HPD death-spiral on locked stalls.
+ *   3) After streak >= 3 with zero frames: full HPD even if SYS_STATUS still "locked"
+ *      (TxAct=0 with TMDS lock is a dead CSI TX — soft path cannot fix it).
  */
 #include "capture_priv.h"
 
@@ -53,6 +54,8 @@ static uint32_t s_cam_h;
 static uint32_t s_cam_v;
 static int s_soft_fail_streak;
 static int64_t s_last_hpd_us;
+
+#define SOFT_FAIL_BEFORE_HPD 3
 
 static void tc358743_resetn_pulse(void)
 {
@@ -177,7 +180,7 @@ static void after_hdmi_lock(tc358743_t *tc)
     }
     tc358743_set_csi_uyvy422(tc, false);
     (void)tc358743_reapply_csi_path_after_hdmi(tc);
-    ESP_LOGI(CAPTURE_LOG_TAG, "CSI path reapplied after HDMI lock (RGB888 VI_MUTE=0)");
+    ESP_LOGI(CAPTURE_LOG_TAG, "CSI path reapplied after HDMI lock (RGB888 AUTO_MUTE non-cont)");
 }
 
 static void drain_done_sem(capture_ctx_t *c)
@@ -359,6 +362,7 @@ static bool wait_new_frames(capture_ctx_t *c, uint32_t done_before, int loops)
     return false;
 }
 
+/** Returns ESP_OK on recovery, ESP_ERR_TIMEOUT if still stuck (caller may HPD). */
 static esp_err_t soft_or_rearm_while_locked(capture_ctx_t *c)
 {
     uint32_t done_before = c->csi_dma_done_irqs;
@@ -385,11 +389,73 @@ static esp_err_t soft_or_rearm_while_locked(capture_ctx_t *c)
     }
 
     s_soft_fail_streak++;
-    ESP_LOGW(CAPTURE_LOG_TAG, "soft+rearm no frames (streak=%d) — staying locked, NO HPD",
-             s_soft_fail_streak);
-    /* Keep trying soft path; do not HPD while still locked. */
+    ESP_LOGW(CAPTURE_LOG_TAG, "soft+rearm no frames (streak=%d)", s_soft_fail_streak);
     (void)tc358743_soft_kick(c->tc);
     return ESP_ERR_TIMEOUT;
+}
+
+static esp_err_t hard_hpd_recover(capture_ctx_t *c)
+{
+    int64_t now = (int64_t)esp_timer_get_time();
+    if ((now - s_last_hpd_us) < (int64_t)8 * 1000000) {
+        ESP_LOGW(CAPTURE_LOG_TAG, "HPD rate-limited — soft only");
+        return soft_or_rearm_while_locked(c);
+    }
+    s_last_hpd_us = now;
+    s_soft_fail_streak = 0;
+
+    ESP_LOGW(CAPTURE_LOG_TAG, "CSI hard recover: HPD");
+
+    if (s_cam_started && s_cam) {
+        (void)esp_cam_ctlr_stop(s_cam);
+        s_cam_started = false;
+    }
+    drain_done_sem(c);
+    c->ping_fb_idx = 0;
+    c->done_fb = NULL;
+
+    (void)tc358743_hdmi_hotplug_reset(c->tc);
+    wait_hdmi_lock(c->tc, 5000);
+
+    if (!tc_locked(c->tc)) {
+        ESP_LOGW(CAPTURE_LOG_TAG, "recover: still unlocked after HPD");
+        (void)tc358743_set_streaming(c->tc, true);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint32_t h = c->hres, v = c->vres;
+    (void)read_hdmi_timing(c->tc, &h, &v);
+
+    if (h != s_cam_h || v != s_cam_v) {
+        ESP_LOGI(CAPTURE_LOG_TAG, "source resolution change %ux%u → %ux%u",
+                 (unsigned)s_cam_h, (unsigned)s_cam_v, (unsigned)h, (unsigned)v);
+        esp_err_t er = recreate_csi_at_size(c, h, v);
+        if (er != ESP_OK) {
+            ESP_LOGE(CAPTURE_LOG_TAG, "CSI recreate failed %s", esp_err_to_name(er));
+            return er;
+        }
+    } else {
+        c->hres = h;
+        c->vres = v;
+        c->frame_bytes = (size_t)h * (size_t)v * 3u;
+        capture_configure_p4_csi_bridge(h, v);
+    }
+
+    ISP.cntl.isp_en = 0;
+    MIPI_CSI_BRIDGE.int_clr.val = 0x3fu;
+    capture_configure_p4_csi_bridge(c->hres, c->vres);
+    esp_err_t er = esp_cam_ctlr_start(s_cam);
+    if (er != ESP_OK) {
+        ESP_LOGE(CAPTURE_LOG_TAG, "CSI recover: cam start failed %s", esp_err_to_name(er));
+        return er;
+    }
+    s_cam_started = true;
+
+    after_hdmi_lock(c->tc);
+    (void)tc358743_set_streaming(c->tc, true);
+    ESP_LOGI(CAPTURE_LOG_TAG, "CSI recover: cam restarted %ux%u",
+             (unsigned)c->hres, (unsigned)c->vres);
+    return ESP_OK;
 }
 
 capture_ctx_t *capture_hw_init_start(void)
@@ -412,7 +478,8 @@ capture_ctx_t *capture_hw_init_start(void)
         .glitch_ignore_cnt = 7,
         .intr_priority = 0,
         .trans_queue_depth = 0,
-        .flags = {.enable_internal_pullup = false},
+        /* Match p4kvm: many FPC / adapter combos need internal pull-ups. */
+        .flags = {.enable_internal_pullup = true},
     };
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus));
 
@@ -519,7 +586,7 @@ capture_ctx_t *capture_hw_init_start(void)
     ISP.cntl.isp_en = 0;
     capture_configure_p4_csi_bridge(s_cap.hres, s_cap.vres);
 
-    /* Cam RX up first, then bridge TX — order that produced continuous frames. */
+    /* Cam RX up, then re-assert bridge TX (p4kvm order after lock). */
     ESP_ERROR_CHECK(esp_cam_ctlr_start(s_cam));
     s_cam_started = true;
     tc358743_set_csi_uyvy422(s_cap.tc, false);
@@ -537,70 +604,20 @@ esp_err_t capture_hw_hdmi_recover(capture_ctx_t *c)
 {
     ESP_RETURN_ON_FALSE(c && c->tc, ESP_ERR_INVALID_ARG, CAPTURE_LOG_TAG, "ctx");
 
-    /* While locked: soft → CTXRST only. Never HPD. */
     if (tc_locked(c->tc)) {
-        return soft_or_rearm_while_locked(c);
-    }
-
-    int64_t now = (int64_t)esp_timer_get_time();
-    if ((now - s_last_hpd_us) < (int64_t)15 * 1000000) {
-        ESP_LOGW(CAPTURE_LOG_TAG, "unlocked but HPD rate-limited — soft only");
-        return soft_or_rearm_while_locked(c);
-    }
-    s_last_hpd_us = now;
-    s_soft_fail_streak = 0;
-
-    ESP_LOGW(CAPTURE_LOG_TAG, "CSI hard recover: HPD (unlocked)");
-
-    if (s_cam_started && s_cam) {
-        (void)esp_cam_ctlr_stop(s_cam);
-        s_cam_started = false;
-    }
-    drain_done_sem(c);
-    c->ping_fb_idx = 0;
-    c->done_fb = NULL;
-
-    (void)tc358743_hdmi_hotplug_reset(c->tc);
-    wait_hdmi_lock(c->tc, 5000);
-
-    if (!tc_locked(c->tc)) {
-        ESP_LOGW(CAPTURE_LOG_TAG, "recover: still unlocked after HPD");
-        (void)tc358743_set_streaming(c->tc, true);
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    uint32_t h = c->hres, v = c->vres;
-    (void)read_hdmi_timing(c->tc, &h, &v);
-
-    if (h != s_cam_h || v != s_cam_v) {
-        ESP_LOGI(CAPTURE_LOG_TAG, "source resolution change %ux%u → %ux%u",
-                 (unsigned)s_cam_h, (unsigned)s_cam_v, (unsigned)h, (unsigned)v);
-        esp_err_t er = recreate_csi_at_size(c, h, v);
-        if (er != ESP_OK) {
-            ESP_LOGE(CAPTURE_LOG_TAG, "CSI recreate failed %s", esp_err_to_name(er));
-            return er;
+        esp_err_t soft = soft_or_rearm_while_locked(c);
+        if (soft == ESP_OK) {
+            return ESP_OK;
         }
-    } else {
-        c->hres = h;
-        c->vres = v;
-        c->frame_bytes = (size_t)h * (size_t)v * 3u;
-        capture_configure_p4_csi_bridge(h, v);
+        /* Locked in SYS_STATUS but no CSI frames after several tries → HPD. */
+        if (s_soft_fail_streak >= SOFT_FAIL_BEFORE_HPD) {
+            ESP_LOGW(CAPTURE_LOG_TAG,
+                     "streak=%d with zero frames despite lock — forcing HPD",
+                     s_soft_fail_streak);
+            return hard_hpd_recover(c);
+        }
+        return soft;
     }
 
-    /* RX first, then TX */
-    ISP.cntl.isp_en = 0;
-    MIPI_CSI_BRIDGE.int_clr.val = 0x3fu;
-    capture_configure_p4_csi_bridge(c->hres, c->vres);
-    esp_err_t er = esp_cam_ctlr_start(s_cam);
-    if (er != ESP_OK) {
-        ESP_LOGE(CAPTURE_LOG_TAG, "CSI recover: cam start failed %s", esp_err_to_name(er));
-        return er;
-    }
-    s_cam_started = true;
-
-    after_hdmi_lock(c->tc);
-    (void)tc358743_set_streaming(c->tc, true);
-    ESP_LOGI(CAPTURE_LOG_TAG, "CSI recover: cam restarted %ux%u",
-             (unsigned)c->hres, (unsigned)c->vres);
-    return ESP_OK;
+    return hard_hpd_recover(c);
 }
